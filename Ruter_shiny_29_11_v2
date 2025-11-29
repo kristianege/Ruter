@@ -201,7 +201,7 @@ server <- function(input, output, session) {
       showNotification("Du skal uploade både CSV filer og XML filer først!", type = "warning")
       return()
     }
-    
+
     withProgress(message = 'Indlæser data...', value = 0, {
       
       # 1. Stier fra upload
@@ -497,7 +497,7 @@ server <- function(input, output, session) {
       
       # Set Seed for reproducibility
       set.seed(42)
-      
+
       # TSP Optimization - OPDATERET MED SIKKERHEDSVENTIL
       daily_plans <- lapply(1:length(routes), function(day) {
         route_indices <- routes[[day]]
@@ -555,27 +555,40 @@ server <- function(input, output, session) {
       # Gem Resultater
       vals$routing_plan <- routing_plan_df
       
-      # --- TJEK OM TVUNGE GRUPPER BLEV SPLITTET ---
+      # --- TJEK OM TVUNGE GRUPPER BLEV SPLITTET (ROBUST POPUP) ---
       split_warnings <- c()
       
       for (i in seq_along(force_together)) {
-        group <- force_together[[i]]
-        # Find hvilke dage disse stationer er endt på
-        # Vi skal kun kigge på dem der faktisk er i planen (i tilfælde af at en station er fravalgt men stadig står i gruppen)
-        station_days <- routing_plan_df %>%
-          filter(StationNumber %in% group) %>%
-          pull(Day) %>%
-          unique()
+        # SIKR DIG AT GRUPPEN ER TEKST (CHARACTER)
+        group <- as.character(force_together[[i]])
         
+        # Find stationer fra gruppen i den faktiske plan. 
+        # Konverter StationNumber til character for at undgå ID-fejl (123 vs "123")
+        group_in_plan <- routing_plan_df %>%
+          filter(as.character(StationNumber) %in% group)
+        
+        # Find hvilke dage de er endt på
+        station_days <- unique(group_in_plan$Day)
+        
+        # Hvis de er fordelt på mere end 1 dag
         if (length(station_days) > 1) {
-          split_warnings <- c(split_warnings, paste0("Gruppe ", i, " blev splittet over ", length(station_days), " dage (Tidsoverskridelse)."))
+          # Hent navne på de stationer der er splittet for bedre info
+          stations_split <- paste(unique(group_in_plan$StationNumber), collapse=", ")
+          split_warnings <- c(split_warnings, 
+                              paste0("Gruppe ", i, " (", stations_split, ") er splittet over ", length(station_days), " dage pga. tidsbegrænsning."))
         }
       }
       
       if (length(split_warnings) > 0) {
-        showNotification(paste(split_warnings, collapse = "\n"), type = "warning", duration = 10)
+        showModal(modalDialog(
+          title = "Advarsel: Tvungne grupper splittet!",
+          HTML(paste(split_warnings, collapse = "<br/><br/>")),
+          footer = modalButton("Forstået"),
+          easyClose = TRUE,
+          fade = FALSE
+        ))
       }
-      
+
       incProgress(1, detail = "Færdig!")
     })
   })
@@ -597,14 +610,36 @@ server <- function(input, output, session) {
     
     pal <- colorFactor(palette = "Paired", domain = df$Day)
     
-    leaflet(df) %>%
-      addTiles() %>%
+    # Hent origin koordinater
+    orig_lon <- vals$origin_df$Longitude
+    orig_lat <- vals$origin_df$Latitude
+    
+    # Start kort
+    map <- leaflet(df) %>% addTiles()
+    
+    # Tegn linjer for hver dag (Origin -> Stations -> Origin)
+    days <- unique(df$Day)
+    for(d in days) {
+      day_data <- df %>% filter(Day == d) %>% arrange(StopOrder)
+      
+      # Byg sti: Origin -> Stationer -> Origin
+      lngs <- c(orig_lon, day_data$Longitude, orig_lon)
+      lats <- c(orig_lat, day_data$Latitude, orig_lat)
+      
+      map <- map %>% addPolylines(lng = lngs, lat = lats, 
+                                  color = pal(d), weight = 3, opacity = 0.8)
+    }
+    
+    # Tilføj punkter ovenpå
+    map <- map %>%
       addCircleMarkers(lng = ~Longitude, lat = ~Latitude,
                        color = ~pal(Day), stroke = FALSE, fillOpacity = 0.8, radius = 8,
                        label = ~paste("Station:", StationNumber, "<br>Dag:", Day, "<br>Stop:", StopOrder),
                        popup = ~paste("<b>Station:</b>", StationNumber, "<br>",
                                       "<b>Prøvetid:</b>", SampleDuration_min, "min")) %>%
       addLegend("bottomright", pal = pal, values = ~Day, title = "Dag")
+    
+    map
   })
   
   output$schedule_table <- renderDT({
@@ -659,12 +694,34 @@ server <- function(input, output, session) {
     
     pal <- colorFactor(palette = "Set2", domain = nuv$Day)
     
-    leaflet(nuv) %>%
-      addTiles() %>%
+    # Hent origin koordinater
+    orig_lon <- vals$origin_df$Longitude
+    orig_lat <- vals$origin_df$Latitude
+    
+    # Start kort
+    map <- leaflet(nuv) %>% addTiles()
+    
+    # Tegn linjer for hver dag (Origin -> Stations -> Origin)
+    # OBS: Vi antager rækkefølgen i CSV filen er ruterækkefølgen
+    days <- unique(nuv$Day)
+    for(d in days) {
+      day_data <- nuv %>% filter(Day == d) # Beholder oprindelig rækkefølge fra dataframe
+      
+      # Byg sti: Origin -> Stationer -> Origin
+      lngs <- c(orig_lon, day_data$Longitude, orig_lon)
+      lats <- c(orig_lat, day_data$Latitude, orig_lat)
+      
+      map <- map %>% addPolylines(lng = lngs, lat = lats, 
+                                  color = pal(d), weight = 3, opacity = 0.8)
+    }
+    
+    map <- map %>%
       addCircleMarkers(lng = ~Longitude, lat = ~Latitude,
                        color = ~pal(Day), stroke = FALSE, fillOpacity = 0.8, radius = 6,
                        label = ~paste("Station:", StationNumber, "<br>Togt:", Day)) %>%
       addLegend("bottomright", pal = pal, values = ~Day, title = "Nuv. Togt")
+    
+    map
   })
   
   # Beregning af sammenligningstabel
