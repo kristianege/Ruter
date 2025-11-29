@@ -1,0 +1,384 @@
+# --- 1. Setup: Load necessary packages ---
+required_packages <- c("sf", "giscoR", "dplyr", "osrm", "TSP", "readr", "xml2", "purrr", "lubridate", "tidyr", "leaflet", "RColorBrewer")
+new_packages <- required_packages[!required_packages %in% installed.packages()[,"Package"]]
+if(length(new_packages)) install.packages(new_packages)
+
+# Load libraries
+library(sf)
+library(giscoR)
+library(dplyr)
+library(readr)
+library(osrm)
+library(TSP)
+library(xml2)
+library(purrr)
+library(lubridate)
+library(tidyr)
+library(RColorBrewer)
+library(leaflet)
+
+# --- 2. Define Origin and Load Station Data ---
+origin_df <- data.frame(
+  StationNumber = "Origin",
+  Longitude = 10.2864,
+  Latitude = 55.14703,
+  SampleDuration_min = 0
+)
+
+Ejby_sluse <- data.frame(
+  StationNumber = "45001606",
+  Longitude = 10.41987,
+  Latitude = 55.39948,
+  SampleDuration_min = 10
+)
+
+# Load and preprocess station data
+# BEMÆRK: Tjek at stien til filerne er korrekt på din computer
+BLG_togter <- read_delim("BLG_togter.csv", delim = ";", escape_double = FALSE, trim_ws = TRUE) %>%
+  mutate(gammel = as.character(gammel), ny = as.character(ny))
+
+# --- 3. Load and Extract Data from XML Files ---
+folder_path <- "./Bifrost_XML"
+xml_files <- list.files(folder_path, pattern = "\\.xml$", full.names = TRUE)
+
+# Function to extract data from XML files
+extract_data <- function(file) {
+  xml <- read_xml(file)
+  
+  tibble(
+    FileName = basename(file),
+    StartDate = xml_find_first(xml, "//SFMeasurement") %>% xml_attr("StartDate") %>% ymd_hms(),
+    EndDate = xml_find_first(xml, "//SFMeasurement") %>% xml_attr("EndDate") %>% ymd_hms(),
+    Key = xml_find_first(xml, "//HymerLocation") %>% xml_attr("Key"),
+    Name = xml_find_first(xml, "//HymerLocation") %>% xml_attr("Name"),
+    Location = xml_find_first(xml, "//HymerLocation") %>% xml_attr("Location"),
+    InstrId = xml_find_first(xml, "//CurMeter") %>% xml_attr("InstrId"),
+    Value = as.numeric(xml_find_first(xml, "//WLStart") %>% xml_attr("Value")),
+    FieldStaffId = xml_find_first(xml, "//FieldStaff") %>% xml_attr("FieldStaffId")
+  )
+}
+
+measure_data_df <- map_df(xml_files, extract_data)
+
+# --- 4. Clean and Merge Data ---
+measure_data_df <- measure_data_df %>%
+  left_join(select(BLG_togter, gammel, ny), by = c("Key" = "gammel")) %>%
+  mutate(StationNumber = ifelse(is.na(ny), Key, ny)) %>%
+  select(-ny, -Key) %>%
+  inner_join(BLG_togter, by = c("StationNumber" = "ny")) %>%
+  select(-gammel, -navn, -togt) %>%
+  mutate(InstrId = ifelse(StationNumber == 45001618, "spand_ur", InstrId)) %>%
+  drop_na() %>%
+  mutate(
+    duration_minutes = as.numeric(difftime(EndDate, StartDate, units = "mins")),
+    Location = gsub(",| ", "_", Location),
+    Name = gsub(" ", "_", Name),
+    st_name = paste(Name, Location, sep = "_"),
+    dayofyear = yday(StartDate),
+    Season = ifelse(month(StartDate) %in% c(12, 1, 2, 3, 4, 5), "Vinter", "Sommer")
+  ) %>%
+  filter(duration_minutes >= 0, duration_minutes < 100) %>%
+  select(-Location)
+
+measure_summary <- measure_data_df %>%
+  group_by(StationNumber, st_name, Season, InstrId) %>%
+  summarise(
+    median_duration = median(duration_minutes),
+    upperquantile = quantile(duration_minutes, 0.75),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    Kemi_tid = 10,
+    data_tid = 10,
+    ekstra_tid = ifelse(st_name %in% c("Brende_Å_St_5.3", "Kongshøj_Å_6.05", "Vejstrup_Å_1.80"), 15, 5),
+    samlet_tid = upperquantile + Kemi_tid + data_tid + ekstra_tid
+  )
+
+measure_summary_max <- measure_summary %>%
+  group_by(st_name, StationNumber, Season) %>%
+  summarise(joint_sample_duration = max(samlet_tid), .groups = 'drop')
+
+# --- 5. Load Station Coordinates ---
+HydrometristationerWMS <- read_delim("HydrometristationerWMS.csv", delim = ";", escape_double = FALSE, trim_ws = TRUE)
+
+st <- HydrometristationerWMS %>%
+  mutate(st = substr(Id, start = 1, stop = 8)) %>%
+  select(-Id, StationNumber = st, Latitude = lat, Longitude = lon)
+
+measure_summary_max <- measure_summary_max %>%
+  left_join(st, by = "StationNumber") %>%
+  drop_na() %>%
+  rename(SampleDuration_min = joint_sample_duration)
+
+# --- 5b. KONFIGURATION AF REGLER (NY SEKTION) ---
+# Her styrer du dine begrænsninger
+
+# 1. Stationer der skal UDELADES helt (Indtast StationNumber som tekst)
+exclude_stations <- c("45001001") # Indsæt reelle numre her, hvis nogen skal udelades
+
+# 2. Stationer der SKAL være på SAMME dag (Liste af vektorer)
+# Hver linje herunder er en gruppe, der tvinges sammen (hvis tiden tillader det)
+force_together_groups <- list(
+  c("45001002", "45001002")#, # Eksempel gruppe 1
+  #c("StationA", "StationB", "StationC") # Eksempel gruppe 2
+)
+
+# 3. Stationer der SKAL være på FORSKELLIGE dage
+# Disse grupper må ikke være i samme bil
+force_apart_groups <- list(
+  c("45001045", "45001045") # Eksempel: Disse to må aldrig mødes
+)
+
+# --- 6. Combine All Locations (OPDATERET) ---
+tour_capacity <- 354 # deltid 6,4t=384m - 30m pause= 354m
+Season_selected <- "Vinter"
+kort_titel<- paste("Togtplan",Season_selected," ")
+
+# Filtrer først stationerne baseret på season OG ekskluderings-listen
+stations_df <- measure_summary_max %>%
+  filter(Season == Season_selected) %>%
+  filter(!StationNumber %in% exclude_stations) %>% # Filtrerer uønskede fra
+  select(-Season, -st_name) %>%
+  bind_rows(Ejby_sluse)
+
+# Sikkerhedsventil: Hvis Ejby_sluse også er i exclude listen, fjern den
+if(Ejby_sluse$StationNumber %in% exclude_stations) {
+  stations_df <- stations_df %>% filter(StationNumber != Ejby_sluse$StationNumber)
+}
+
+all_locations <- bind_rows(origin_df, stations_df)
+
+# Reset row names for at sikre indeks passer til matricen
+rownames(all_locations) <- NULL 
+
+# --- 7. Calculate Travel Time Matrix ---
+print("Calculating travel time matrix... (this may take a moment)")
+# Rettet: Bruger nu hele all_locations dynamisk i stedet for hardcoded 1:45
+travel_times <- osrmTable(loc = all_locations[, c("Longitude", "Latitude")])
+time_matrix <- travel_times$durations
+
+# --- 8. VRP Analysis using Clarke and Wright Savings Heuristic (OPDATERET) ---
+station_indices <- 2:nrow(all_locations)
+savings <- data.frame(i = integer(), j = integer(), saving = double())
+
+# Standard Savings Calculation
+for (i in station_indices) {
+  for (j in station_indices) {
+    if (i < j) {
+      saving_val <- time_matrix[1, i] + time_matrix[1, j] - time_matrix[i, j]
+      savings <- rbind(savings, data.frame(i = i, j = j, saving = saving_val))
+    }
+  }
+}
+
+# --- LOGIK: TVING SAMMEN (Boost savings) ---
+# Vi finder indeks for stationer der skal sammen og giver dem kunstigt høj saving
+for (group in force_together_groups) {
+  # Find hvilke rækkenumre i all_locations disse stationer har
+  group_indices <- match(group, all_locations$StationNumber)
+  group_indices <- group_indices[!is.na(group_indices)] # Fjern hvis de ikke findes i data
+  
+  if (length(group_indices) > 1) {
+    # Lav alle kombinationer i gruppen (hvis mere end 2, forbindes alle med alle)
+    pairs <- combn(group_indices, 2)
+    for (k in 1:ncol(pairs)) {
+      idx_i <- min(pairs[, k])
+      idx_j <- max(pairs[, k])
+      
+      # Find rækken i savings tabellen og giv den kæmpe værdi
+      row_id <- which(savings$i == idx_i & savings$j == idx_j)
+      if (length(row_id) > 0) {
+        savings$saving[row_id] <- 10000000 + savings$saving[row_id]
+      }
+    }
+  }
+}
+
+# Sorter nu, så de tvungne par ligger øverst
+savings <- savings %>% arrange(desc(saving))
+
+# Initialize Routes
+routes <- as.list(station_indices)
+
+# Helper function: Check conflicts (Force Apart)
+check_conflicts <- function(proposed_route_indices, all_locs, conflict_list) {
+  if (length(conflict_list) == 0) return(FALSE)
+  
+  # Hent stationsnumre for den foreslåede rute
+  route_station_ids <- all_locs$StationNumber[proposed_route_indices]
+  
+  for (conflict_group in conflict_list) {
+    # Tæl hvor mange fra konflikt-gruppen der er i ruten
+    matches <- sum(route_station_ids %in% conflict_group)
+    # Hvis mere end 1 station fra en "uvenne-gruppe" er med, er det en konflikt
+    if (matches > 1) return(TRUE) 
+  }
+  return(FALSE)
+}
+
+# Function to calculate total time for a route
+calculate_route_time <- function(route, time_matrix, all_locations) {
+  full_path <- c(1, route, 1)
+  travel_time <- sum(sapply(1:(length(full_path) - 1), function(k) {
+    time_matrix[full_path[k], full_path[k + 1]]
+  }))
+  service_time <- sum(all_locations$SampleDuration_min[route])
+  return(travel_time + service_time)
+}
+
+# Iteratively merge routes
+for (k in 1:nrow(savings)) {
+  i <- savings$i[k]
+  j <- savings$j[k]
+  
+  route_i_idx <- which(sapply(routes, function(r) i %in% r))
+  route_j_idx <- which(sapply(routes, function(r) j %in% r))
+  
+  if (length(route_i_idx) == 0 || length(route_j_idx) == 0) next 
+  
+  if (route_i_idx != route_j_idx) {
+    route_i <- routes[[route_i_idx]]
+    route_j <- routes[[route_j_idx]]
+    
+    if ((i == route_i[1] || i == route_i[length(route_i)]) &&
+        (j == route_j[1] || j == route_j[length(route_j)])) {
+      
+      # Vend ruterne om nødvendigt for at enderne mødes
+      if (i == route_i[1]) route_i <- rev(route_i)
+      if (j == route_j[length(route_j)]) route_j <- rev(route_j)
+      
+      new_route <- c(route_i, route_j)
+      
+      # 1. Tjek tid
+      time_ok <- calculate_route_time(new_route, time_matrix, all_locations) <= tour_capacity
+      
+      # 2. Tjek konflikter (Force Apart)
+      conflict_found <- check_conflicts(new_route, all_locations, force_apart_groups)
+      
+      if (time_ok && !conflict_found) {
+        routes[[route_i_idx]] <- new_route
+        routes[[route_j_idx]] <- NULL
+      }
+    }
+  }
+}
+
+# --- 9. Create and Optimize Final Routing Plan (FORBEDRET) ---
+print("Optimizing route order per day...")
+
+daily_plans <- lapply(1:length(routes), function(day) {
+  route_indices <- routes[[day]]
+  
+  # Hvis ruten er meget kort (f.eks. 1-2 stop), er optimering ligegyldig
+  if(length(route_indices) > 2) {
+    
+    # 1. Udtræk sub-matrix for netop disse stop (+ origin/index 1)
+    # Vi skal huske at inkludere Origin (index 1) i optimeringen
+    stops_for_day <- c(1, route_indices) 
+    sub_matrix <- time_matrix[stops_for_day, stops_for_day]
+    
+    # 2. Lav TSP problem
+    tsp_prob <- ATSP(sub_matrix)
+    
+    # 3. Løs med 'arbitrary insertion' (god og hurtig) eller '2-opt'
+    # Vi tvinger den til at starte og slutte i Origin (index 1 i sub_matrix)
+    tour <- solve_TSP(tsp_prob, method = "arbitrary_insertion", control = list(start = 1))
+    
+    # 4. Uddrag den nye rækkefølge (fjern origin fra starten igen)
+    ordered_indices_local <- as.integer(tour)
+    
+    # Konverter tilbage til de originale globale indeks
+    # ordered_indices_local refererer til positionen i 'stops_for_day'
+    # Vi fjerner første og sidste element da det er Origin (1)
+    actual_route_order <- stops_for_day[ordered_indices_local]
+    actual_route_order <- actual_route_order[actual_route_order != 1]
+    
+    route_indices <- actual_route_order
+  }
+  
+  # Beregn den endelige tid med den nye rækkefølge
+  route_time <- calculate_route_time(route_indices, time_matrix, all_locations)
+  
+  data.frame(
+    Day = day,
+    StopOrder = 1:length(route_indices),
+    StationNumber = all_locations$StationNumber[route_indices],
+    DailyRouteTime_min = round(route_time, 1)
+  )
+})
+
+routing_plan_df <- bind_rows(daily_plans) %>%
+  left_join(stations_df, by = "StationNumber") %>%
+  arrange(Day, StopOrder) %>%
+  select(Day, DailyRouteTime_min, StopOrder, StationNumber, Longitude, Latitude, SampleDuration_min)
+
+print("--- Final Optimized Routing Plan ---")
+print(routing_plan_df)
+
+# --- 10. Visualisering af routing_plan_df med leaflet ---
+day_colors <- colorFactor(palette = "Paired",
+                          domain = routing_plan_df$Day)
+
+leaflet() %>%
+  addTiles() %>%
+  setView(lng = mean(routing_plan_df$Longitude), lat = mean(routing_plan_df$Latitude), zoom = 9) %>%
+  addCircleMarkers(data = routing_plan_df,
+                   lng = ~Longitude,
+                   lat = ~Latitude,
+                   color = ~day_colors(Day),
+                   stroke = FALSE,
+                   fillOpacity = 0.8,
+                   radius = 6,
+                   label = ~paste(StationNumber, "<br>Dag:", Day))%>%
+  addControl(
+    html = paste("<div style='background-color: white; padding: 10px; border-radius: 5px;'>", kort_titel, "</div>"),
+    position = "topright"
+  )
+
+# --- 11. Existing Routes ---
+nuværende_stationer <- left_join(BLG_togter, st, by = c("ny" = "StationNumber")) %>%
+  select(-ny, -gammel, -navn, StationNumber = ny, Day = togt)
+
+# print(nuværende_stationer)
+
+day_colors_ex <- colorFactor(palette = "Paired",
+                             domain = nuværende_stationer$Day)
+
+leaflet() %>%
+  addTiles() %>%
+  setView(lng = mean(nuværende_stationer$Longitude, na.rm=TRUE), lat = mean(nuværende_stationer$Latitude, na.rm=TRUE), zoom = 9) %>%
+  addCircleMarkers(data = nuværende_stationer,
+                   lng = ~Longitude,
+                   lat = ~Latitude,
+                   color = ~day_colors_ex(Day),
+                   stroke = FALSE,
+                   fillOpacity = 0.8,
+                   radius = 6,
+                   label = ~paste(StationNumber, "<br>togt:", Day))%>%
+  addControl(
+    html = "<div style='background-color: white; padding: 10px; border-radius: 5px;'>Nuværende togter</div>",
+    position = "topright"
+  )
+
+# --- 12. Calculate Time for a Manual/Pre-defined Plan ---
+# Note: Hvis nuværende_stationer indeholder stationer du har ekskluderet i step 6,
+# vil calculate_route_time fejle herunder, fordi den bruger all_locations.
+# Kun relevant hvis du sammenligner 1:1 med det filtrerede dataset.
+
+manual_plan_summary <- nuværende_stationer %>%
+  filter(StationNumber %in% all_locations$StationNumber) %>% # Sikrer at vi kun beregner for stationer der stadig er med
+  group_by(Day) %>%
+  summarise(
+    route_indices = list(match(StationNumber, all_locations$StationNumber)),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    DailyRouteTime_min = sapply(route_indices, function(idx) {
+      calculate_route_time(idx, time_matrix, all_locations)
+    })
+  )
+
+print("Summary of Manual Plan Costs (Filtered for Excluded Stations):")
+print(select(manual_plan_summary, Day, DailyRouteTime_min))
+
+cat("\nTotal time for the manual plan (minutes):", round(sum(manual_plan_summary$DailyRouteTime_min), 1), "\n")
