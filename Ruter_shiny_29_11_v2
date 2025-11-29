@@ -74,6 +74,13 @@ ui <- fluidPage(
       numericInput("tour_capacity", "Max tid pr. dag (min):", value = 354, min = 100, max = 600),
       
       hr(),
+      h4("Tidsindstillinger (Generelt)"),
+      numericInput("time_chem", "Kemi tid (min):", value = 10, min = 0),
+      numericInput("time_data", "Data tid (min):", value = 10, min = 0),
+      numericInput("time_base_extra", "Generel ekstra tid (min):", value = 5, min = 0),
+      helpText("Disse lægges til 'Median Duration' for alle stationer."),
+      
+      hr(),
       h4("2. Datafiler"),
       helpText("Upload alle filer herunder. XML-filer skal vælges samlet."),
       
@@ -128,6 +135,23 @@ ui <- fluidPage(
                             verbatimTextOutput("apart_list_display")
                           )
                    )
+                 ),
+                 hr(),
+                 fluidRow(
+                   column(12,
+                          wellPanel(
+                            h4("4. Specifikke Tidsjusteringer"),
+                            p("Her kan du give enkelte stationer mere/mindre ekstra tid end den generelle sats."),
+                            fluidRow(
+                              column(4, uiOutput("time_override_ui")),
+                              column(3, numericInput("override_val", "Ekstra tid (min):", value = 15, min = 0)),
+                              column(2, br(), actionButton("add_override", "Tilføj", icon = icon("plus"))),
+                              column(2, br(), actionButton("clear_override", "Ryd Alle", class = "btn-danger btn-xs"))
+                            ),
+                            h5("Aktive Justeringer (Overskriver 'Generel ekstra tid'):"),
+                            verbatimTextOutput("override_list_display")
+                          )
+                   )
                  )
         ),
         
@@ -178,7 +202,8 @@ server <- function(input, output, session) {
   # Reaktive værdier til at gemme data og regler
   vals <- reactiveValues(
     base_data = NULL,
-    measure_summary_max = NULL,
+    measure_summary = NULL, # Raw summary before time calc
+    measure_summary_max = NULL, # Final summary for routing
     all_locations = NULL,
     routing_plan = NULL,
     time_matrix = NULL,
@@ -190,7 +215,8 @@ server <- function(input, output, session) {
     HydrometristationerWMS = NULL, # Raw WMS data
     # Lister til regler
     force_together_groups = list(),
-    force_apart_groups = list()
+    force_apart_groups = list(),
+    time_overrides = data.frame(StationNumber = character(), Time = numeric(), stringsAsFactors = FALSE)
   )
   
   # --- TRIN 1: INDLÆS DATA ---
@@ -258,35 +284,34 @@ server <- function(input, output, session) {
         filter(duration_minutes >= 0, duration_minutes < 100) %>%
         select(-Location)
       
+      # Beregn basis statistik (Quantiles) - UDEN at lægge fast tid til endnu
       measure_summary <- measure_data_df %>%
         group_by(StationNumber, st_name, Season, InstrId) %>%
         summarise(
           median_duration = median(duration_minutes),
           upperquantile = quantile(duration_minutes, 0.75),
           .groups = 'drop'
-        ) %>%
-        mutate(
-          Kemi_tid = 10,
-          data_tid = 10,
-          ekstra_tid = ifelse(st_name %in% c("Brende_Å_St_5.3", "Kongshøj_Å_6.05", "Vejstrup_Å_1.80"), 15, 5),
-          samlet_tid = upperquantile + Kemi_tid + data_tid + ekstra_tid
         )
       
-      measure_summary_max <- measure_summary %>%
+      # Opret en midlertidig version for at kunne generere stationslister til UI
+      # Vi bruger standardværdier her, men de overskrives ved kørsel
+      measure_summary_temp <- measure_summary %>%
+        mutate(samlet_tid = upperquantile + 10 + 10 + 5) %>%
         group_by(st_name, StationNumber, Season) %>%
         summarise(joint_sample_duration = max(samlet_tid), .groups = 'drop')
-      
+        
       st <- HydrometristationerWMS %>%
         mutate(st = substr(Id, start = 1, stop = 8)) %>%
         select(-Id, StationNumber = st, Latitude = lat, Longitude = lon)
       
-      measure_summary_max <- measure_summary_max %>%
+      measure_summary_temp <- measure_summary_temp %>%
         left_join(st, by = "StationNumber") %>%
         drop_na() %>%
         rename(SampleDuration_min = joint_sample_duration)
       
       # Gem til reactive values
-      vals$measure_summary_max <- measure_summary_max
+      vals$measure_summary <- measure_summary # Gemmer basis
+      vals$measure_summary_max <- measure_summary_temp # Gemmer temp for UI lister
       vals$origin_df <- origin_df
       vals$Ejby_sluse <- Ejby_sluse
       vals$BLG_togter <- BLG_togter
@@ -314,7 +339,9 @@ server <- function(input, output, session) {
   
   # A. EXCLUDE UI
   output$exclude_ui <- renderUI({
-    req(stations_list())
+    if(!vals$data_loaded) {
+      return(selectInput("dummy_exclude", NULL, choices = "Indlæs data først..."))
+    }
     selectizeInput("exclude_stations", NULL, choices = stations_list(), multiple = TRUE, options = list(placeholder = 'Vælg stationer...'))
   })
   
@@ -324,7 +351,9 @@ server <- function(input, output, session) {
   
   # B. TOGETHER UI
   output$together_ui <- renderUI({
-    req(stations_list())
+    if(!vals$data_loaded) {
+      return(selectInput("dummy_together", NULL, choices = "Indlæs data først..."))
+    }
     selectizeInput("sel_together", NULL, choices = stations_list(), multiple = TRUE, options = list(placeholder = 'Vælg 2+ stationer...'))
   })
   
@@ -334,9 +363,7 @@ server <- function(input, output, session) {
       showNotification("Vælg mindst 2 stationer for at lave en gruppe.", type = "warning")
       return()
     }
-    # Tilføj til listen
     vals$force_together_groups[[length(vals$force_together_groups) + 1]] <- input$sel_together
-    # Nulstil valg
     updateSelectizeInput(session, "sel_together", selected = character(0))
   })
   
@@ -353,7 +380,9 @@ server <- function(input, output, session) {
   
   # C. APART UI
   output$apart_ui <- renderUI({
-    req(stations_list())
+    if(!vals$data_loaded) {
+      return(selectInput("dummy_apart", NULL, choices = "Indlæs data først..."))
+    }
     selectizeInput("sel_apart", NULL, choices = stations_list(), multiple = TRUE, options = list(placeholder = 'Vælg 2+ stationer...'))
   })
   
@@ -378,6 +407,36 @@ server <- function(input, output, session) {
     }), collapse = "\n")
   })
   
+  # D. TIME OVERRIDE UI
+  output$time_override_ui <- renderUI({
+    if(!vals$data_loaded) {
+      return(selectInput("dummy_override", NULL, choices = "Indlæs data først..."))
+    }
+    selectizeInput("sel_override_st", NULL, choices = stations_list(), multiple = FALSE, options = list(placeholder = 'Vælg station...'))
+  })
+  
+  observeEvent(input$add_override, {
+    req(input$sel_override_st, input$override_val)
+    
+    # Fjern eksisterende hvis findes
+    current <- vals$time_overrides %>% filter(StationNumber != input$sel_override_st)
+    
+    # Tilføj ny
+    new_entry <- data.frame(StationNumber = input$sel_override_st, Time = input$override_val, stringsAsFactors = FALSE)
+    vals$time_overrides <- rbind(current, new_entry)
+    
+    updateSelectizeInput(session, "sel_override_st", selected = character(0))
+  })
+  
+  observeEvent(input$clear_override, {
+    vals$time_overrides <- data.frame(StationNumber = character(), Time = numeric(), stringsAsFactors = FALSE)
+  })
+  
+  output$override_list_display <- renderText({
+    if(nrow(vals$time_overrides) == 0) return("Ingen specifikke tidsjusteringer.")
+    paste(apply(vals$time_overrides, 1, function(x) paste0(x['StationNumber'], ": ", x['Time'], " min")), collapse = "\n")
+  })
+  
   # --- TRIN 3: BEREGNING ---
   
   observeEvent(input$run_calc, {
@@ -385,7 +444,39 @@ server <- function(input, output, session) {
     
     withProgress(message = 'Beregner Ruter...', value = 0, {
       
-      # Hent inputs
+      incProgress(0.1, detail = "Beregner tidsforbrug pr. station")
+      
+      # 1. BEREGN TIDER DYNAMISK BASERET PÅ INPUTS
+      # Hent basis data (med quantiles)
+      df_calc <- vals$measure_summary
+      
+      # Hent overrides
+      overrides <- vals$time_overrides
+      
+      # Flet overrides ind
+      df_calc <- df_calc %>%
+        left_join(overrides, by = "StationNumber") %>%
+        rename(Manual_Extra = Time)
+      
+      # Beregn samlet tid
+      df_calc <- df_calc %>%
+        mutate(
+          Kemi_tid = input$time_chem,
+          data_tid = input$time_data,
+          # Hvis der er manuel override, brug den, ellers brug basis input
+          ekstra_tid = ifelse(!is.na(Manual_Extra), Manual_Extra, input$time_base_extra),
+          samlet_tid = upperquantile + Kemi_tid + data_tid + ekstra_tid
+        )
+      
+      # Gruppér og find max for stationen (ligesom før)
+      measure_summary_max <- df_calc %>%
+        group_by(st_name, StationNumber, Season) %>%
+        summarise(joint_sample_duration = max(samlet_tid), .groups = 'drop') %>%
+        left_join(vals$st, by = "StationNumber") %>%
+        drop_na() %>%
+        rename(SampleDuration_min = joint_sample_duration)
+      
+      # Hent andre inputs
       exclude_list <- input$exclude_stations
       force_together <- vals$force_together_groups
       force_apart <- vals$force_apart_groups
@@ -393,7 +484,7 @@ server <- function(input, output, session) {
       season_sel <- input$season
       
       # Filtrering
-      stations_df <- vals$measure_summary_max %>%
+      stations_df <- measure_summary_max %>%
         filter(Season == season_sel) %>%
         filter(!StationNumber %in% exclude_list) %>%
         select(-Season, -st_name) %>%
@@ -407,7 +498,7 @@ server <- function(input, output, session) {
       all_locations <- bind_rows(vals$origin_df, stations_df)
       rownames(all_locations) <- NULL 
       
-      incProgress(0.2, detail = "Henter afstande (OSRM)")
+      incProgress(0.3, detail = "Henter afstande (OSRM)")
       
       # Matrix beregning
       tryCatch({
