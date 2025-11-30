@@ -104,7 +104,7 @@ ui <- fluidPage(
       numericInput("time_chem", "Kemi tid (min):", value = 10, min = 0),
       numericInput("time_data", "Data tid (min):", value = 10, min = 0),
       numericInput("time_base_extra", "Generel ekstra tid (min):", value = 5, min = 0),
-      helpText("Disse lægges til 'Median Duration' for alle stationer."),
+      helpText("Disse lægges til 'Upper Quantile' (75% fraktil) for alle stationer."),
       
       hr(),
       h4("2. Datafiler"),
@@ -804,7 +804,7 @@ server <- function(input, output, session) {
            "Total tidsforbrug: ", round(total_time, 0), " minutter.")
   })
   
-  # Reactive map object for optimized route (used for both render and download)
+  # Reactive map object for optimized route
   optimized_map_reactive <- reactive({
     req(vals$routing_plan)
     df <- vals$routing_plan
@@ -838,11 +838,6 @@ server <- function(input, output, session) {
                        label = ~paste("Station:", StationNumber, "<br>Dag:", Day, "<br>Stop:", StopOrder),
                        popup = ~paste("<b>Station:</b>", StationNumber, "<br>",
                                       "<b>Prøvetid:</b>", SampleDuration_min, "min")) %>%
-      #addLabelOnlyMarkers(lng = ~Longitude, lat = ~Latitude,
-      #                    label = ~as.character(StationNumber),
-      #                    labelOptions = labelOptions(noHide = TRUE, textOnly = TRUE, 
-      #                                                direction = 'right', offset = c(10, 0),
-      #                                                style = list("font-weight" = "bold", "color" = "black", "font-size" = "12px"))) %>%
       addLegend("bottomright", pal = pal, values = ~Day, title = "Dag")
     
     map
@@ -972,11 +967,6 @@ server <- function(input, output, session) {
       addCircleMarkers(lng = ~Longitude, lat = ~Latitude,
                        color = ~pal(Day), stroke = FALSE, fillOpacity = 0.8, radius = 6,
                        label = ~paste("Station:", StationNumber, "<br>Togt:", Day)) %>%
-      #addLabelOnlyMarkers(lng = ~Longitude, lat = ~Latitude,
-      #                    label = ~as.character(StationNumber),
-      #                    labelOptions = labelOptions(noHide = TRUE, textOnly = TRUE, 
-      #                                                direction = 'right', offset = c(10, 0),
-      #                                                style = list("font-weight" = "bold", "color" = "black", "font-size" = "12px"))) %>%
       addLegend("bottomright", pal = pal, values = ~Day, title = "Nuv. Togt")
     
     map
