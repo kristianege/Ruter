@@ -187,9 +187,16 @@ ui <- fluidPage(
         ),
         
         tabPanel("Resultat (Tabel)", 
-                 h3("Køreplan Detaljer"),
+                 h3("Køreplan Detaljer (Ny Plan)"),
                  DTOutput("schedule_table"),
                  downloadButton("download_plan", "Download Køreplan (CSV)")
+        ),
+        
+        tabPanel("Nuværende Plan (Tabel)",
+                 h3("Køreplan Detaljer (Nuværende Plan)"),
+                 p("Viser den nuværende plan med beregnede køretider (optimeret rækkefølge) og prøvetagningstider."),
+                 DTOutput("current_schedule_table"),
+                 downloadButton("download_current_plan", "Download Nuværende Plan (CSV)")
         ),
         
         tabPanel("Sammenligning",
@@ -232,6 +239,7 @@ server <- function(input, output, session) {
     measure_summary_max = NULL, # Final summary for routing
     all_locations = NULL,
     routing_plan = NULL,
+    current_plan_detailed = NULL, # NY: Gemmer detaljeret nuværende plan
     time_matrix = NULL,
     all_locations_final = NULL,
     data_loaded = FALSE,
@@ -679,6 +687,51 @@ server <- function(input, output, session) {
       # Gem Resultater
       vals$routing_plan <- routing_plan_df
       
+      
+      # --- NY FUNKTION: BEREGN DETALJERET TABEL FOR NUVÆRENDE PLAN ---
+      
+      # Filtrer nuværende plan til kun at inkludere de stationer vi har data på
+      nuv_data <- vals$BLG_togter %>%
+        mutate(StationNumber = ny) %>%
+        filter(StationNumber %in% all_locations$StationNumber)
+      
+      if(nrow(nuv_data) > 0) {
+        current_plans_list <- lapply(unique(nuv_data$togt), function(d) {
+          # Hent stationer for denne dag
+          day_stations <- nuv_data %>% filter(togt == d) %>% pull(StationNumber)
+          
+          # Find indeks i all_locations (som passer til matricen)
+          indices <- match(day_stations, all_locations$StationNumber)
+          indices <- indices[!is.na(indices)]
+          
+          if(length(indices) == 0) return(NULL)
+          
+          # Optimer rækkefølgen (fair sammenligning)
+          optimized_idx <- optimize_sequence(indices, time_matrix)
+          
+          # Beregn tid
+          route_time <- calculate_route_time(optimized_idx, time_matrix, all_locations)
+          
+          # Byg dataframe
+          data.frame(
+            Day = d,
+            StopOrder = 1:length(optimized_idx),
+            StationNumber = all_locations$StationNumber[optimized_idx],
+            DailyRouteTime_min = round(route_time, 1)
+          )
+        })
+        
+        current_plan_df <- bind_rows(current_plans_list) %>%
+          left_join(stations_df, by = "StationNumber") %>% # Hent SampleDuration_min m.m.
+          arrange(Day, StopOrder)
+        
+        vals$current_plan_detailed <- current_plan_df
+      } else {
+        vals$current_plan_detailed <- NULL
+      }
+      # -------------------------------------------------------------
+      
+      
       # --- TJEK OM TVUNGE GRUPPER BLEV SPLITTET (ROBUST POPUP) ---
       split_warnings <- c()
       
@@ -770,6 +823,19 @@ server <- function(input, output, session) {
     req(vals$routing_plan)
     datatable(vals$routing_plan, options = list(pageLength = 25))
   })
+  
+  # NY TABEL: CURRENT PLAN DETAILED
+  output$current_schedule_table <- renderDT({
+    req(vals$current_plan_detailed)
+    datatable(vals$current_plan_detailed, options = list(pageLength = 25))
+  })
+  
+  output$download_current_plan <- downloadHandler(
+    filename = function() { paste("nuværende_plan_detaljeret_", Sys.Date(), ".csv", sep = "") },
+    content = function(file) {
+      write.csv(vals$current_plan_detailed, file, row.names = FALSE)
+    }
+  )
   
   # NYE OUTPUTS TIL RÅDATA OG MATRIX
   
