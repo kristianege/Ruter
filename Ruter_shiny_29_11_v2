@@ -13,6 +13,7 @@ library(tidyr)
 library(RColorBrewer)
 library(leaflet)
 library(DT) # For pæne tabeller
+library(htmlwidgets) # Til at gemme kort som HTML
 
 # Øg max upload størrelse hvis nødvendigt (her sat til 50MB)
 options(shiny.maxRequestSize = 50*1024^2)
@@ -183,7 +184,9 @@ ui <- fluidPage(
         tabPanel("Resultat (Kort)", 
                  h3("Optimeret Ruteplan"),
                  leafletOutput("map_optimized", height = "600px"),
-                 verbatimTextOutput("summary_text")
+                 verbatimTextOutput("summary_text"),
+                 br(),
+                 downloadButton("download_map_html", "Download Kort (HTML)", class = "btn-info")
         ),
         
         tabPanel("Resultat (Tabel)", 
@@ -801,7 +804,8 @@ server <- function(input, output, session) {
            "Total tidsforbrug: ", round(total_time, 0), " minutter.")
   })
   
-  output$map_optimized <- renderLeaflet({
+  # Reactive map object for optimized route (used for both render and download)
+  optimized_map_reactive <- reactive({
     req(vals$routing_plan)
     df <- vals$routing_plan
     
@@ -834,10 +838,26 @@ server <- function(input, output, session) {
                        label = ~paste("Station:", StationNumber, "<br>Dag:", Day, "<br>Stop:", StopOrder),
                        popup = ~paste("<b>Station:</b>", StationNumber, "<br>",
                                       "<b>Prøvetid:</b>", SampleDuration_min, "min")) %>%
+      addLabelOnlyMarkers(lng = ~Longitude, lat = ~Latitude,
+                          label = ~as.character(StationNumber),
+                          labelOptions = labelOptions(noHide = TRUE, textOnly = TRUE, 
+                                                      direction = 'right', offset = c(10, 0),
+                                                      style = list("font-weight" = "bold", "color" = "black", "font-size" = "12px"))) %>%
       addLegend("bottomright", pal = pal, values = ~Day, title = "Dag")
     
     map
   })
+  
+  output$map_optimized <- renderLeaflet({
+    optimized_map_reactive()
+  })
+  
+  output$download_map_html <- downloadHandler(
+    filename = function() { paste("ruteplan_kort_", Sys.Date(), ".html", sep="") },
+    content = function(file) {
+      saveWidget(optimized_map_reactive(), file = file, selfcontained = TRUE)
+    }
+  )
   
   output$schedule_table <- renderDT({
     req(vals$routing_plan)
@@ -952,6 +972,11 @@ server <- function(input, output, session) {
       addCircleMarkers(lng = ~Longitude, lat = ~Latitude,
                        color = ~pal(Day), stroke = FALSE, fillOpacity = 0.8, radius = 6,
                        label = ~paste("Station:", StationNumber, "<br>Togt:", Day)) %>%
+      addLabelOnlyMarkers(lng = ~Longitude, lat = ~Latitude,
+                          label = ~as.character(StationNumber),
+                          labelOptions = labelOptions(noHide = TRUE, textOnly = TRUE, 
+                                                      direction = 'right', offset = c(10, 0),
+                                                      style = list("font-weight" = "bold", "color" = "black", "font-size" = "12px"))) %>%
       addLegend("bottomright", pal = pal, values = ~Day, title = "Nuv. Togt")
     
     map
