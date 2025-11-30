@@ -308,6 +308,13 @@ server <- function(input, output, session) {
         left_join(st, by = "StationNumber") %>%
         drop_na() %>%
         rename(SampleDuration_min = joint_sample_duration)
+        
+      # --- FIX: TILFØJ EJBY SLUSE TIL UI LISTEN HER ---
+      Ejby_UI <- Ejby_sluse %>%
+        mutate(st_name = "Ejby Sluse", Season = "Begge") 
+      
+      measure_summary_temp <- bind_rows(measure_summary_temp, Ejby_UI)
+      # ------------------------------------------------
       
       # Gem til reactive values
       vals$measure_summary <- measure_summary # Gemmer basis
