@@ -62,7 +62,7 @@ check_conflicts <- function(proposed_route_indices, all_locs, conflict_list) {
   return(FALSE)
 }
 
-# Hjælpefunktion til at optimere rækkefølge af en liste indeks (Bruges til Nuværende Plan)
+# Hjælpefunktion til at optimere rækkefølge af en liste indeks (Bruges til Nuværende Plan og Merge Check)
 optimize_sequence <- function(indices, time_mat) {
   if(length(indices) < 2) return(indices)
   
@@ -613,7 +613,27 @@ server <- function(input, output, session) {
             
             new_route <- c(route_i, route_j)
             
-            time_ok <- calculate_route_time(new_route, time_matrix, all_locations) <= tour_capacity
+            # --- INTELLIGENT MERGE LOGIC START ---
+            
+            # 1. Prøv simpel beregning først
+            current_time <- calculate_route_time(new_route, time_matrix, all_locations)
+            time_ok <- current_time <= tour_capacity
+            
+            # 2. Hvis simpel failer, prøv at optimere rækkefølgen (TSP) for at se om det KAN lade sig gøre
+            if (!time_ok) {
+               # Vi optimerer kun hvis ruten er over grænsen, for at se om vi kan redde den
+               # Dette sikrer at 'tvungne' grupper der er ulogisk sammensat i standard-algoritmen
+               # alligevel får lov at merge, HVIS de kan optimeres til at være lovlige.
+               opt_route <- optimize_sequence(new_route, time_matrix)
+               opt_time <- calculate_route_time(opt_route, time_matrix, all_locations)
+               
+               if (opt_time <= tour_capacity) {
+                 time_ok <- TRUE
+                 new_route <- opt_route # VIGTIGT: Opdater rækkefølgen så endepunkterne passer til virkeligheden
+               }
+            }
+            # --- INTELLIGENT MERGE LOGIC END ---
+
             # Force Apart Logic (Brug listen direkte)
             conflict_found <- check_conflicts(new_route, all_locations, force_apart)
             
