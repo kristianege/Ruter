@@ -62,6 +62,31 @@ check_conflicts <- function(proposed_route_indices, all_locs, conflict_list) {
   return(FALSE)
 }
 
+# Hjælpefunktion til at optimere rækkefølge af en liste indeks (Bruges til Nuværende Plan)
+optimize_sequence <- function(indices, time_mat) {
+  if(length(indices) < 2) return(indices)
+  
+  # Inkluder origin (1) i optimeringen
+  stops <- c(1, indices)
+  
+  # Tjek at indekserne er inden for matricens grænser
+  if(max(stops) > nrow(time_mat)) return(indices)
+  
+  sub_mat <- time_mat[stops, stops]
+  
+  tryCatch({
+    set.seed(42) # Sikrer konsistens
+    tsp <- ATSP(sub_mat)
+    tour <- solve_TSP(tsp, method = "arbitrary_insertion", control = list(start = 1))
+    ord <- as.integer(tour)
+    new_stops <- stops[ord]
+    # Fjern origin igen
+    return(new_stops[new_stops != 1])
+  }, error = function(e) {
+    return(indices) # Fallback hvis TSP fejler
+  })
+}
+
 # --- UI DEFINITION ---
 
 ui <- fluidPage(
@@ -170,8 +195,9 @@ ui <- fluidPage(
         tabPanel("Sammenligning",
                  h3("Nuværende vs. Ny"),
                  p("Bemærk: Statistikken dækker kun stationer, der er inkluderet i beregningen (dvs. fraregnet dine manuelle fravalg)."),
+                 p("Kortet for 'Nuværende Plan' viser nu en optimeret kørerækkefølge baseret på de samme beregninger."),
                  fluidRow(
-                   column(6, h4("Nuværende Plan (Kort)"), leafletOutput("map_current", height = "500px")),
+                   column(6, h4("Nuværende Plan (Optimeret Rækkefølge)"), leafletOutput("map_current", height = "500px")),
                    column(6, h4("Statistik"), tableOutput("comparison_table"))
                  )
         ),
@@ -799,15 +825,38 @@ server <- function(input, output, session) {
     # Start kort
     map <- leaflet(nuv) %>% addTiles()
     
-    # Tegn linjer for hver dag (Origin -> Stations -> Origin)
-    # OBS: Vi antager rækkefølgen i CSV filen er ruterækkefølgen
     days <- unique(nuv$Day)
     for(d in days) {
-      day_data <- nuv %>% filter(Day == d) # Beholder oprindelig rækkefølge fra dataframe
+      day_data <- nuv %>% filter(Day == d) 
       
-      # Byg sti: Origin -> Stationer -> Origin
+      # ----------------------------------------------------
+      # OPTIMERING AF RUTE PÅ KORT (hvis matrix findes)
+      # ----------------------------------------------------
+      # Standard: Brug CSV rækkefølge
       lngs <- c(orig_lon, day_data$Longitude, orig_lon)
       lats <- c(orig_lat, day_data$Latitude, orig_lat)
+      
+      # Hvis matrix og locations er beregnet (efter knap-tryk), så optimer
+      if(!is.null(vals$time_matrix) && !is.null(vals$all_locations_final)) {
+         
+         # Find indekser for stationerne i all_locations
+         ids <- day_data$StationNumber
+         matrix_indices <- match(ids, vals$all_locations_final$StationNumber)
+         
+         # Kun hvis alle stationer findes i matricen (dvs. ingen er ekskluderet)
+         if(!any(is.na(matrix_indices))) {
+             # Optimer rækkefølge
+             opt_indices <- optimize_sequence(matrix_indices, vals$time_matrix)
+             
+             # Hent koordinater i den NYE rækkefølge
+             # (Vi bruger vals$all_locations_final fordi den matcher matrix-indeks)
+             ordered_locs <- vals$all_locations_final[opt_indices, ]
+             
+             lngs <- c(orig_lon, ordered_locs$Longitude, orig_lon)
+             lats <- c(orig_lat, ordered_locs$Latitude, orig_lat)
+         }
+      }
+      # ----------------------------------------------------
       
       map <- map %>% addPolylines(lng = lngs, lat = lats, 
                                   color = pal(d), weight = 3, opacity = 0.8)
@@ -844,9 +893,12 @@ server <- function(input, output, session) {
       ) %>%
       mutate(
         # Beregn tid for denne gamle rute med de nye rejsetider
+        # MEN: Vi optimerer rækkefølgen først med 'optimize_sequence'
         Tid_min = sapply(route_indices, function(idx) {
-          # Vi skal bruge calculate_route_time (som tilføjer origin start/slut)
-          calculate_route_time(idx, vals$time_matrix, vals$all_locations_final)
+          # 1. Optimer rækkefølgen af stop (for fair sammenligning)
+          optimized_idx <- optimize_sequence(idx, vals$time_matrix)
+          # 2. Beregn tid
+          calculate_route_time(optimized_idx, vals$time_matrix, vals$all_locations_final)
         })
       )
     
