@@ -710,51 +710,6 @@ server <- function(input, output, session) {
       # Gem Resultater
       vals$routing_plan <- routing_plan_df
       
-      
-      # --- NY FUNKTION: BEREGN DETALJERET TABEL FOR NUVÆRENDE PLAN ---
-      
-      # Filtrer nuværende plan til kun at inkludere de stationer vi har data på
-      nuv_data <- vals$BLG_togter %>%
-        mutate(StationNumber = ny) %>%
-        filter(StationNumber %in% all_locations$StationNumber)
-      
-      if(nrow(nuv_data) > 0) {
-        current_plans_list <- lapply(unique(nuv_data$togt), function(d) {
-          # Hent stationer for denne dag
-          day_stations <- nuv_data %>% filter(togt == d) %>% pull(StationNumber)
-          
-          # Find indeks i all_locations (som passer til matricen)
-          indices <- match(day_stations, all_locations$StationNumber)
-          indices <- indices[!is.na(indices)]
-          
-          if(length(indices) == 0) return(NULL)
-          
-          # Optimer rækkefølgen (fair sammenligning)
-          optimized_idx <- optimize_sequence(indices, time_matrix)
-          
-          # Beregn tid
-          route_time <- calculate_route_time(optimized_idx, time_matrix, all_locations)
-          
-          # Byg dataframe
-          data.frame(
-            Day = d,
-            StopOrder = 1:length(optimized_idx),
-            StationNumber = all_locations$StationNumber[optimized_idx],
-            DailyRouteTime_min = round(route_time, 1)
-          )
-        })
-        
-        current_plan_df <- bind_rows(current_plans_list) %>%
-          left_join(stations_df, by = "StationNumber") %>% # Hent SampleDuration_min m.m.
-          arrange(Day, StopOrder)
-        
-        vals$current_plan_detailed <- current_plan_df
-      } else {
-        vals$current_plan_detailed <- NULL
-      }
-      # -------------------------------------------------------------
-      
-      
       # --- TJEK OM TVUNGE GRUPPER BLEV SPLITTET (ROBUST POPUP) ---
       split_warnings <- c()
       
@@ -838,11 +793,6 @@ server <- function(input, output, session) {
                        label = ~paste("Station:", StationNumber, "<br>Dag:", Day, "<br>Stop:", StopOrder),
                        popup = ~paste("<b>Station:</b>", StationNumber, "<br>",
                                       "<b>Prøvetid:</b>", SampleDuration_min, "min")) %>%
-      addLabelOnlyMarkers(lng = ~Longitude, lat = ~Latitude,
-                          label = ~as.character(StationNumber),
-                          labelOptions = labelOptions(noHide = TRUE, textOnly = TRUE, 
-                                                      direction = 'right', offset = c(10, 0),
-                                                      style = list("font-weight" = "bold", "color" = "black", "font-size" = "12px"))) %>%
       addLegend("bottomright", pal = pal, values = ~Day, title = "Dag")
     
     map
@@ -972,11 +922,6 @@ server <- function(input, output, session) {
       addCircleMarkers(lng = ~Longitude, lat = ~Latitude,
                        color = ~pal(Day), stroke = FALSE, fillOpacity = 0.8, radius = 6,
                        label = ~paste("Station:", StationNumber, "<br>Togt:", Day)) %>%
-      addLabelOnlyMarkers(lng = ~Longitude, lat = ~Latitude,
-                          label = ~as.character(StationNumber),
-                          labelOptions = labelOptions(noHide = TRUE, textOnly = TRUE, 
-                                                      direction = 'right', offset = c(10, 0),
-                                                      style = list("font-weight" = "bold", "color" = "black", "font-size" = "12px"))) %>%
       addLegend("bottomright", pal = pal, values = ~Day, title = "Nuv. Togt")
     
     map
