@@ -14,6 +14,7 @@ library(RColorBrewer)
 library(leaflet)
 library(DT) # For pæne tabeller
 library(htmlwidgets) # Til at gemme kort som HTML
+library(openxlsx) # Til at gemme Excel filer
 
 # Øg max upload størrelse hvis nødvendigt (her sat til 50MB)
 options(shiny.maxRequestSize = 50*1024^2)
@@ -63,28 +64,25 @@ check_conflicts <- function(proposed_route_indices, all_locs, conflict_list) {
   return(FALSE)
 }
 
-# Hjælpefunktion til at optimere rækkefølge af en liste indeks (Bruges til Nuværende Plan og Merge Check)
+# Hjælpefunktion til at optimere rækkefølge af en liste indeks
 optimize_sequence <- function(indices, time_mat) {
   if(length(indices) < 2) return(indices)
   
-  # Inkluder origin (1) i optimeringen
-  stops <- c(1, indices)
+  stops <- c(1, indices) # 1 er Origin
   
-  # Tjek at indekserne er inden for matricens grænser
   if(max(stops) > nrow(time_mat)) return(indices)
   
   sub_mat <- time_mat[stops, stops]
   
   tryCatch({
-    set.seed(42) # Sikrer konsistens
+    set.seed(42) 
     tsp <- ATSP(sub_mat)
     tour <- solve_TSP(tsp, method = "arbitrary_insertion", control = list(start = 1))
     ord <- as.integer(tour)
     new_stops <- stops[ord]
-    # Fjern origin igen
     return(new_stops[new_stops != 1])
   }, error = function(e) {
-    return(indices) # Fallback hvis TSP fejler
+    return(indices) 
   })
 }
 
@@ -98,6 +96,8 @@ ui <- fluidPage(
       h4("1. Opsætning"),
       selectInput("season", "Vælg Sæson:", choices = c("Vinter", "Sommer"), selected = "Vinter"),
       numericInput("tour_capacity", "Max tid pr. dag (min):", value = 354, min = 100, max = 600),
+      numericInput("min_stops", "Min. stationer pr. dag:", value = 1, min = 1, max = 20),
+      checkboxInput("force_osrm", "Tving ny OSRM-beregning (nulstil matrix-rettelser)", value = FALSE),
       
       hr(),
       h4("Tidsindstillinger (Generelt)"),
@@ -118,7 +118,6 @@ ui <- fluidPage(
       actionButton("load_data", "Indlæs og Behandl Data", class = "btn-primary", width = "100%"),
       br(), br(),
       
-      # Viser kun beregningsknappen når data er indlæst
       uiOutput("run_button_ui")
     ),
     
@@ -141,24 +140,28 @@ ui <- fluidPage(
                           wellPanel(
                             h4("2. Tving Sammen"),
                             helpText("Vælg stationer der SKAL køres på samme dag."),
-                            uiOutput("together_ui"), # Dropdown
+                            uiOutput("together_ui"), 
                             actionButton("add_together", "Tilføj Gruppe", icon = icon("plus")),
-                            actionButton("clear_together", "Slet Alle", icon = icon("trash"), class = "btn-danger btn-xs"),
                             hr(),
                             h5("Aktive Grupper:"),
-                            verbatimTextOutput("together_list_display")
+                            DTOutput("table_together"), 
+                            br(),
+                            actionButton("delete_together", "Slet Valgte", class = "btn-warning btn-xs"),
+                            actionButton("clear_together", "Slet Alle", icon = icon("trash"), class = "btn-danger btn-xs")
                           )
                    ),
                    column(4,
                           wellPanel(
                             h4("3. Tving Adskilt"),
                             helpText("Vælg stationer der IKKE må være på samme tur."),
-                            uiOutput("apart_ui"), # Dropdown
+                            uiOutput("apart_ui"), 
                             actionButton("add_apart", "Tilføj Konflikt", icon = icon("plus")),
-                            actionButton("clear_apart", "Slet Alle", icon = icon("trash"), class = "btn-danger btn-xs"),
                             hr(),
                             h5("Aktive Konflikter:"),
-                            verbatimTextOutput("apart_list_display")
+                            DTOutput("table_apart"), 
+                            br(),
+                            actionButton("delete_apart", "Slet Valgte", class = "btn-warning btn-xs"),
+                            actionButton("clear_apart", "Slet Alle", icon = icon("trash"), class = "btn-danger btn-xs")
                           )
                    )
                  ),
@@ -171,11 +174,13 @@ ui <- fluidPage(
                             fluidRow(
                               column(4, uiOutput("time_override_ui")),
                               column(3, numericInput("override_val", "Ekstra tid (min):", value = 15, min = 0)),
-                              column(2, br(), actionButton("add_override", "Tilføj", icon = icon("plus"))),
-                              column(2, br(), actionButton("clear_override", "Ryd Alle", class = "btn-danger btn-xs"))
+                              column(2, br(), actionButton("add_override", "Tilføj", icon = icon("plus")))
                             ),
                             h5("Aktive Justeringer (Overskriver 'Generel ekstra tid'):"),
-                            verbatimTextOutput("override_list_display")
+                            DTOutput("table_overrides"),
+                            br(),
+                            actionButton("delete_override", "Slet Valgte", class = "btn-warning btn-xs"),
+                            actionButton("clear_override", "Ryd Alle", class = "btn-danger btn-xs")
                           )
                    )
                  )
@@ -192,38 +197,54 @@ ui <- fluidPage(
         tabPanel("Resultat (Tabel)", 
                  h3("Køreplan Detaljer (Ny Plan)"),
                  DTOutput("schedule_table"),
-                 downloadButton("download_plan", "Download Køreplan (CSV)")
+                 br(),
+                 downloadButton("download_plan", "Download CSV"),
+                 downloadButton("download_plan_xlsx", "Download Excel", class = "btn-success"),
+                 downloadButton("download_plan_html", "Download HTML", class = "btn-info"),
+                 downloadButton("download_blg_format", "Download som BLG-fil (CSV)", class = "btn-primary")
+        ),
+        
+        tabPanel("Nuværende Plan (Kort)",
+                 h3("Nuværende Plan (Manuelt/Optimeret Rækkefølge)"),
+                 p("Viser den nuværende plan (baseret på BLG-filen, inkl. dine manuelle ændringer)."),
+                 leafletOutput("map_current", height = "600px"),
+                 br(),
+                 downloadButton("download_map_current_html", "Download Kort (HTML)", class = "btn-info")
         ),
         
         tabPanel("Nuværende Plan (Tabel)",
                  h3("Køreplan Detaljer (Nuværende Plan)"),
                  p("Viser den nuværende plan med beregnede køretider (optimeret rækkefølge) og prøvetagningstider."),
                  DTOutput("current_schedule_table"),
-                 downloadButton("download_current_plan", "Download Nuværende Plan (CSV)")
+                 br(),
+                 downloadButton("download_current_plan", "Download CSV"),
+                 downloadButton("download_current_plan_xlsx", "Download Excel", class = "btn-success"),
+                 downloadButton("download_current_plan_html", "Download HTML", class = "btn-info")
         ),
         
         tabPanel("Sammenligning",
                  h3("Nuværende vs. Ny"),
                  p("Bemærk: Statistikken dækker kun stationer, der er inkluderet i beregningen (dvs. fraregnet dine manuelle fravalg)."),
-                 p("Kortet for 'Nuværende Plan' viser nu en optimeret kørerækkefølge baseret på de samme beregninger."),
                  fluidRow(
-                   column(6, h4("Nuværende Plan (Optimeret Rækkefølge)"), leafletOutput("map_current", height = "500px")),
-                   column(6, h4("Statistik"), tableOutput("comparison_table"))
+                   column(12, h4("Statistik"), tableOutput("comparison_table"))
                  )
         ),
         
-        tabPanel("Rådata (CSV)",
-                 h3("Indlæste Data"),
-                 p("Her kan du se indholdet af de uploadede CSV filer."),
+        tabPanel("Rådata & Manuel Planlægning",
+                 h3("Indlæste Data (Editerbare)"),
+                 p("Her kan du se og rette i den indlæste plan (BLG Togter). Ændringer her bruges som 'Nuværende Plan' når du trykker 'Kør Ruteberegning'."),
                  tabsetPanel(
-                   tabPanel("BLG Togter", DTOutput("table_blg")),
+                   tabPanel("BLG Togter (Editerbar)", 
+                            DTOutput("table_blg"),
+                            helpText("Dobbeltklik i en celle for at redigere (f.eks. skift togt nummer). Header og ID er låst.")
+                   ),
                    tabPanel("WMS Stationer", DTOutput("table_wms"))
                  )
         ),
         
         tabPanel("Rejsetidsmatrix",
-                 h3("Beregnet Rejsetidsmatrix"),
-                 p("Viser rejsetid i minutter mellem alle valgte stationer (kræver at beregningen er kørt)."),
+                 h3("Beregnet Rejsetidsmatrix (Editerbar)"),
+                 p("Viser rejsetid i minutter. Dobbeltklik på en celle for at ændre tiden manuelt. Ændringen træder i kraft ved næste beregning (hvis 'Tving ny beregning' er slået fra)."),
                  DTOutput("table_matrix")
         )
       )
@@ -235,31 +256,29 @@ ui <- fluidPage(
 
 server <- function(input, output, session) {
   
-  # Reaktive værdier til at gemme data og regler
+  # Reaktive værdier
   vals <- reactiveValues(
     base_data = NULL,
-    measure_summary = NULL, # Raw summary before time calc
-    measure_summary_max = NULL, # Final summary for routing
+    measure_summary = NULL, 
+    measure_summary_max = NULL, 
     all_locations = NULL,
     routing_plan = NULL,
-    current_plan_detailed = NULL, # NY: Gemmer detaljeret nuværende plan
+    current_plan_detailed = NULL, 
     time_matrix = NULL,
     all_locations_final = NULL,
     data_loaded = FALSE,
     # CSV data storage
     BLG_togter = NULL,
-    st = NULL, # Processed WMS data
-    HydrometristationerWMS = NULL, # Raw WMS data
-    # Lister til regler
-    force_together_groups = list(),
-    force_apart_groups = list(),
+    st = NULL, 
+    HydrometristationerWMS = NULL,
+    # Regler som DataFrames for nemmere visning i DT
+    force_together_df = data.frame(ID = integer(), Stationer = character(), stringsAsFactors = FALSE),
+    force_apart_df = data.frame(ID = integer(), Stationer = character(), stringsAsFactors = FALSE),
     time_overrides = data.frame(StationNumber = character(), Time = numeric(), stringsAsFactors = FALSE)
   )
   
   # --- TRIN 1: INDLÆS DATA ---
   observeEvent(input$load_data, {
-    
-    # Tjek at filer er uploadet
     if (is.null(input$file_blg) || is.null(input$file_wms) || is.null(input$xml_files)) {
       showNotification("Du skal uploade både CSV filer og XML filer først!", type = "warning")
       return()
@@ -267,17 +286,13 @@ server <- function(input, output, session) {
 
     withProgress(message = 'Indlæser data...', value = 0, {
       
-      # 1. Stier fra upload
       path_blg <- input$file_blg$datapath
       path_wms <- input$file_wms$datapath
       
-      # 2. Definer Origin og Ejby Sluse
-      origin_df <- data.frame(StationNumber = "Origin", Longitude = 10.2864, Latitude = 55.14703, SampleDuration_min = 0)
-      Ejby_sluse <- data.frame(StationNumber = "45001606", Longitude = 10.41987, Latitude = 55.39948, SampleDuration_min = 10)
+      origin_df <- data.frame(StationNumber = "Origin", StationName = "Svendborg Lab", Label = "Origin - Svendborg Lab", Longitude = 10.2864, Latitude = 55.14703, SampleDuration_min = 0)
+      Ejby_sluse <- data.frame(StationNumber = "45001606", StationName = "Ejby Sluse", Label = "45001606 - Ejby Sluse", Longitude = 10.41987, Latitude = 55.39948, SampleDuration_min = 10)
       
       incProgress(0.2, detail = "Læser CSV filer")
-      
-      # 3. Læs CSV
       tryCatch({
         BLG_togter <- read_delim(path_blg, delim = ";", escape_double = FALSE, trim_ws = TRUE, show_col_types = FALSE) %>%
           mutate(gammel = as.character(gammel), ny = as.character(ny))
@@ -288,10 +303,7 @@ server <- function(input, output, session) {
         return(NULL)
       })
       
-      # 4. XML Behandling (Bruger uploadede filer)
-      incProgress(0.4, detail = "Behandler uploadede XML filer")
-      
-      # map2 bruges til at iterere over både sti og filnavn
+      incProgress(0.4, detail = "Behandler XML filer")
       measure_data_df <- map2_df(input$xml_files$datapath, input$xml_files$name, extract_data_uploaded)
       
       if(nrow(measure_data_df) == 0) {
@@ -299,8 +311,7 @@ server <- function(input, output, session) {
         return(NULL)
       }
       
-      # 5. Data Cleaning
-      incProgress(0.7, detail = "Renser og sammenstiller data")
+      incProgress(0.7, detail = "Renser data")
       
       measure_data_df <- measure_data_df %>%
         left_join(select(BLG_togter, gammel, ny), by = c("Key" = "gammel")) %>%
@@ -330,16 +341,21 @@ server <- function(input, output, session) {
           .groups = 'drop'
         )
       
-      # Opret en midlertidig version for at kunne generere stationslister til UI
-      # Vi bruger standardværdier her, men de overskrives ved kørsel
       measure_summary_temp <- measure_summary %>%
         mutate(samlet_tid = upperquantile + 10 + 10 + 5) %>%
         group_by(st_name, StationNumber, Season) %>%
         summarise(joint_sample_duration = max(samlet_tid), .groups = 'drop')
         
+      # === NY LOGIK: UDTRÆK NAVN FRA WMS FIL ===
+      # WMS format: "45001919 Lundby Å, 2.01"
+      # Vi splitter Id ved første mellemrum
       st <- HydrometristationerWMS %>%
-        mutate(st = substr(Id, start = 1, stop = 8)) %>%
-        select(-Id, StationNumber = st, Latitude = lat, Longitude = lon)
+        mutate(
+          st = substr(Id, start = 1, stop = 8),
+          StationName = substring(Id, 10), # Alt efter de første 9 tegn (8 tal + 1 mellemrum)
+          Label = paste(st, "-", StationName)
+        ) %>%
+        select(-Id, StationNumber = st, StationName, Label, Latitude = lat, Longitude = lon)
       
       measure_summary_temp <- measure_summary_temp %>%
         left_join(st, by = "StationNumber") %>%
@@ -374,111 +390,137 @@ server <- function(input, output, session) {
     actionButton("run_calc", "Kør Ruteberegning", class = "btn-success", width = "100%", icon = icon("play"), style="font-size: 1.2em;")
   })
   
-  # Hent stationsliste
-  stations_list <- reactive({
+  # Hent stationsliste som Named List (Navn = ID) for Selectize
+  stations_list_named <- reactive({
     req(vals$measure_summary_max)
-    st <- unique(vals$measure_summary_max$StationNumber)
-    sort(st)
+    # Lav en navngivet vektor: c("45001919 - Lundby Å" = "45001919", ...)
+    choices <- setNames(vals$measure_summary_max$StationNumber, vals$measure_summary_max$Label)
+    # Sorter efter label (navn)
+    choices[order(names(choices))]
   })
   
   # A. EXCLUDE UI
   output$exclude_ui <- renderUI({
-    if(!vals$data_loaded) {
-      return(selectInput("dummy_exclude", NULL, choices = "Indlæs data først..."))
-    }
-    selectizeInput("exclude_stations", NULL, choices = stations_list(), multiple = TRUE, options = list(placeholder = 'Vælg stationer...'))
+    if(!vals$data_loaded) return(selectInput("dummy", NULL, choices = "Indlæs data først..."))
+    selectizeInput("exclude_stations", NULL, choices = stations_list_named(), multiple = TRUE, options = list(placeholder = 'Søg efter navn eller nummer...'))
   })
+  observeEvent(input$reset_exclude, { updateSelectizeInput(session, "exclude_stations", selected = character(0)) })
   
-  observeEvent(input$reset_exclude, {
-    updateSelectizeInput(session, "exclude_stations", selected = character(0))
-  })
-  
-  # B. TOGETHER UI
+  # B. TOGETHER (Tabel baseret)
   output$together_ui <- renderUI({
-    if(!vals$data_loaded) {
-      return(selectInput("dummy_together", NULL, choices = "Indlæs data først..."))
-    }
-    selectizeInput("sel_together", NULL, choices = stations_list(), multiple = TRUE, options = list(placeholder = 'Vælg 2+ stationer...'))
+    if(!vals$data_loaded) return(selectInput("dummy", NULL, choices = "Indlæs data først..."))
+    selectizeInput("sel_together", NULL, choices = stations_list_named(), multiple = TRUE, options = list(placeholder = 'Søg efter navn eller nummer...'))
   })
   
   observeEvent(input$add_together, {
     req(input$sel_together)
     if(length(input$sel_together) < 2) {
-      showNotification("Vælg mindst 2 stationer for at lave en gruppe.", type = "warning")
+      showNotification("Vælg mindst 2 stationer.", type = "warning")
       return()
     }
-    vals$force_together_groups[[length(vals$force_together_groups) + 1]] <- input$sel_together
+    
+    # Hent labels for display i tabel
+    labels <- names(stations_list_named())[match(input$sel_together, stations_list_named())]
+    display_str <- paste(labels, collapse = "; ")
+    
+    # Tilføj til DF (Gem ID'er internt, vis Navne eksternt)
+    new_id <- if(nrow(vals$force_together_df) == 0) 1 else max(vals$force_together_df$ID) + 1
+    
+    # Vi gemmer ID'erne som en streng "ID1, ID2" til logikken
+    ids_str <- paste(input$sel_together, collapse = ", ")
+    
+    new_row <- data.frame(ID = new_id, Stationer = display_str, IDs_Hidden = ids_str, stringsAsFactors = FALSE)
+    vals$force_together_df <- rbind(vals$force_together_df, new_row)
     updateSelectizeInput(session, "sel_together", selected = character(0))
   })
   
-  observeEvent(input$clear_together, {
-    vals$force_together_groups <- list()
+  observeEvent(input$delete_together, {
+    req(input$table_together_rows_selected)
+    vals$force_together_df <- vals$force_together_df[-input$table_together_rows_selected, ]
+  })
+  observeEvent(input$clear_together, { vals$force_together_df <- vals$force_together_df[0,] })
+  
+  output$table_together <- renderDT({
+    # Vis kun "Stationer" kolonnen (med navne), skjul ID og IDs_Hidden
+    df_show <- vals$force_together_df %>% select(Stationer)
+    datatable(df_show, selection = 'multiple', options = list(dom = 't', paging = FALSE), rownames = FALSE)
   })
   
-  output$together_list_display <- renderText({
-    if(length(vals$force_together_groups) == 0) return("Ingen grupper defineret.")
-    paste(sapply(1:length(vals$force_together_groups), function(i) {
-      paste("Gruppe", i, ":", paste(vals$force_together_groups[[i]], collapse = ", "))
-    }), collapse = "\n")
-  })
-  
-  # C. APART UI
+  # C. APART (Tabel baseret)
   output$apart_ui <- renderUI({
-    if(!vals$data_loaded) {
-      return(selectInput("dummy_apart", NULL, choices = "Indlæs data først..."))
-    }
-    selectizeInput("sel_apart", NULL, choices = stations_list(), multiple = TRUE, options = list(placeholder = 'Vælg 2+ stationer...'))
+    if(!vals$data_loaded) return(selectInput("dummy", NULL, choices = "Indlæs data først..."))
+    selectizeInput("sel_apart", NULL, choices = stations_list_named(), multiple = TRUE, options = list(placeholder = 'Søg efter navn eller nummer...'))
   })
   
   observeEvent(input$add_apart, {
     req(input$sel_apart)
     if(length(input$sel_apart) < 2) {
-      showNotification("Vælg mindst 2 stationer for at lave en konflikt.", type = "warning")
+      showNotification("Vælg mindst 2 stationer.", type = "warning")
       return()
     }
-    vals$force_apart_groups[[length(vals$force_apart_groups) + 1]] <- input$sel_apart
+    
+    labels <- names(stations_list_named())[match(input$sel_apart, stations_list_named())]
+    display_str <- paste(labels, collapse = "; ")
+    ids_str <- paste(input$sel_apart, collapse = ", ")
+    
+    new_id <- if(nrow(vals$force_apart_df) == 0) 1 else max(vals$force_apart_df$ID) + 1
+    new_row <- data.frame(ID = new_id, Stationer = display_str, IDs_Hidden = ids_str, stringsAsFactors = FALSE)
+    vals$force_apart_df <- rbind(vals$force_apart_df, new_row)
     updateSelectizeInput(session, "sel_apart", selected = character(0))
   })
   
-  observeEvent(input$clear_apart, {
-    vals$force_apart_groups <- list()
+  observeEvent(input$delete_apart, {
+    req(input$table_apart_rows_selected)
+    vals$force_apart_df <- vals$force_apart_df[-input$table_apart_rows_selected, ]
+  })
+  observeEvent(input$clear_apart, { vals$force_apart_df <- vals$force_apart_df[0,] })
+  
+  output$table_apart <- renderDT({
+    df_show <- vals$force_apart_df %>% select(Stationer)
+    datatable(df_show, selection = 'multiple', options = list(dom = 't', paging = FALSE), rownames = FALSE)
   })
   
-  output$apart_list_display <- renderText({
-    if(length(vals$force_apart_groups) == 0) return("Ingen konflikter defineret.")
-    paste(sapply(1:length(vals$force_apart_groups), function(i) {
-      paste("Konflikt", i, ":", paste(vals$force_apart_groups[[i]], collapse = ", "))
-    }), collapse = "\n")
-  })
-  
-  # D. TIME OVERRIDE UI
+  # D. TIME OVERRIDE (NU OGSÅ SOM TABEL MED SLET MULIGHED)
   output$time_override_ui <- renderUI({
-    if(!vals$data_loaded) {
-      return(selectInput("dummy_override", NULL, choices = "Indlæs data først..."))
-    }
-    selectizeInput("sel_override_st", NULL, choices = stations_list(), multiple = FALSE, options = list(placeholder = 'Vælg station...'))
+    if(!vals$data_loaded) return(selectInput("dummy", NULL, choices = "Indlæs data først..."))
+    selectizeInput("sel_override_st", NULL, choices = stations_list_named(), multiple = FALSE, options = list(placeholder = 'Vælg station...'))
   })
   
   observeEvent(input$add_override, {
     req(input$sel_override_st, input$override_val)
-    
     # Fjern eksisterende hvis findes
     current <- vals$time_overrides %>% filter(StationNumber != input$sel_override_st)
-    
-    # Tilføj ny
     new_entry <- data.frame(StationNumber = input$sel_override_st, Time = input$override_val, stringsAsFactors = FALSE)
     vals$time_overrides <- rbind(current, new_entry)
-    
     updateSelectizeInput(session, "sel_override_st", selected = character(0))
   })
   
-  observeEvent(input$clear_override, {
-    vals$time_overrides <- data.frame(StationNumber = character(), Time = numeric(), stringsAsFactors = FALSE)
+  observeEvent(input$delete_override, {
+    req(input$table_overrides_rows_selected)
+    vals$time_overrides <- vals$time_overrides[-input$table_overrides_rows_selected, ]
   })
   
-  output$override_list_display <- renderText({
-    if(nrow(vals$time_overrides) == 0) return("Ingen specifikke tidsjusteringer.")
-    paste(apply(vals$time_overrides, 1, function(x) paste0(x['StationNumber'], ": ", x['Time'], " min")), collapse = "\n")
+  observeEvent(input$clear_override, { vals$time_overrides <- data.frame(StationNumber = character(), Time = numeric(), stringsAsFactors = FALSE) })
+  
+  output$table_overrides <- renderDT({
+    # Flet med navne for visning
+    if(nrow(vals$time_overrides) > 0) {
+      df_show <- vals$time_overrides %>%
+        left_join(vals$st, by = "StationNumber") %>%
+        select(Label, Time) %>%
+        rename(Station = Label, "Ekstra Tid (min)" = Time)
+    } else {
+      df_show <- data.frame(Station = character(), "Ekstra Tid (min)" = numeric(), check.names=FALSE)
+    }
+    
+    datatable(df_show, selection = 'multiple', options = list(dom = 't', paging = FALSE), rownames = FALSE)
+  })
+  
+  # --- EDITERBAR BLG TABEL ---
+  observeEvent(input$table_blg_cell_edit, {
+    info <- input$table_blg_cell_edit
+    # Opdater data i hukommelsen
+    vals$BLG_togter[info$row, info$col] <- info$value
   })
   
   # --- TRIN 3: BEREGNING ---
@@ -490,29 +532,21 @@ server <- function(input, output, session) {
       
       incProgress(0.1, detail = "Beregner tidsforbrug pr. station")
       
-      # 1. BEREGN TIDER DYNAMISK BASERET PÅ INPUTS
-      # Hent basis data (med quantiles)
+      # 1. BEREGN TIDER
       df_calc <- vals$measure_summary
-      
-      # Hent overrides
       overrides <- vals$time_overrides
-      
-      # Flet overrides ind
       df_calc <- df_calc %>%
         left_join(overrides, by = "StationNumber") %>%
         rename(Manual_Extra = Time)
       
-      # Beregn samlet tid
       df_calc <- df_calc %>%
         mutate(
           Kemi_tid = input$time_chem,
           data_tid = input$time_data,
-          # Hvis der er manuel override, brug den, ellers brug basis input
           ekstra_tid = ifelse(!is.na(Manual_Extra), Manual_Extra, input$time_base_extra),
           samlet_tid = upperquantile + Kemi_tid + data_tid + ekstra_tid
         )
       
-      # Gruppér og find max for stationen (ligesom før)
       measure_summary_max <- df_calc %>%
         group_by(st_name, StationNumber, Season) %>%
         summarise(joint_sample_duration = max(samlet_tid), .groups = 'drop') %>%
@@ -520,10 +554,17 @@ server <- function(input, output, session) {
         drop_na() %>%
         rename(SampleDuration_min = joint_sample_duration)
       
-      # Hent andre inputs
       exclude_list <- input$exclude_stations
-      force_together <- vals$force_together_groups
-      force_apart <- vals$force_apart_groups
+      
+      # Konverter DF regler tilbage til lister for algoritmen (Brug IDs_Hidden kolonnen)
+      force_together <- if(nrow(vals$force_together_df) > 0) {
+        lapply(strsplit(vals$force_together_df$IDs_Hidden, ", "), function(x) trimws(x))
+      } else { list() }
+      
+      force_apart <- if(nrow(vals$force_apart_df) > 0) {
+        lapply(strsplit(vals$force_apart_df$IDs_Hidden, ", "), function(x) trimws(x))
+      } else { list() }
+      
       tour_capacity <- input$tour_capacity
       season_sel <- input$season
       
@@ -542,19 +583,37 @@ server <- function(input, output, session) {
       all_locations <- bind_rows(vals$origin_df, stations_df)
       rownames(all_locations) <- NULL 
       
-      incProgress(0.3, detail = "Henter afstande (OSRM)")
+      incProgress(0.3, detail = "Henter/tjekker afstande (OSRM)")
       
-      # Matrix beregning
-      tryCatch({
-        travel_times <- osrmTable(loc = all_locations[, c("Longitude", "Latitude")])
-        time_matrix <- travel_times$durations
-      }, error = function(e) {
-        showNotification("Fejl ved OSRM kald. Tjek internetforbindelse.", type = "error")
-        return(NULL)
-      })
+      # MATRIX REUSE LOGIC
+      current_ids <- all_locations$StationNumber
+      matrix_exists <- !is.null(vals$time_matrix)
       
-      # GEM tidsmatrix og location (bruges til comparison senere)
-      vals$time_matrix <- time_matrix
+      reuse_matrix <- FALSE
+      if(matrix_exists) {
+        if(nrow(vals$time_matrix) == length(current_ids) && 
+           all(rownames(vals$time_matrix) == current_ids)) {
+           reuse_matrix <- TRUE
+        }
+      }
+      
+      if(reuse_matrix && !input$force_osrm) {
+         time_matrix <- vals$time_matrix
+         showNotification("Genbruger eksisterende rejsetidsmatrix (inkl. evt. rettelser).", type = "message")
+      } else {
+         # Hent ny matrix
+         tryCatch({
+            travel_times <- osrmTable(loc = all_locations[, c("Longitude", "Latitude")])
+            time_matrix <- travel_times$durations
+            rownames(time_matrix) <- current_ids
+            colnames(time_matrix) <- current_ids
+            vals$time_matrix <- time_matrix # Gem matrix med ID'er
+         }, error = function(e) {
+            showNotification("Fejl ved OSRM kald. Tjek internetforbindelse.", type = "error")
+            return(NULL)
+         })
+      }
+      
       vals$all_locations_final <- all_locations
       
       incProgress(0.5, detail = "Optimerer ruter (Clarke-Wright)")
@@ -572,7 +631,7 @@ server <- function(input, output, session) {
         }
       }
       
-      # Force Together Logic (Brug listen direkte)
+      # Force Together (Boost savings)
       for (group in force_together) {
         group_indices <- match(group, all_locations$StationNumber)
         group_indices <- group_indices[!is.na(group_indices)]
@@ -591,10 +650,9 @@ server <- function(input, output, session) {
       }
       
       savings <- savings %>% arrange(desc(saving))
-      
-      # Build Routes
       routes <- as.list(station_indices)
       
+      # Merge Loop
       for (k in 1:nrow(savings)) {
         i <- savings$i[k]
         j <- savings$j[k]
@@ -616,28 +674,19 @@ server <- function(input, output, session) {
             
             new_route <- c(route_i, route_j)
             
-            # --- INTELLIGENT MERGE LOGIC START ---
-            
-            # 1. Prøv simpel beregning først
+            # Intelligent Merge Logic
             current_time <- calculate_route_time(new_route, time_matrix, all_locations)
             time_ok <- current_time <= tour_capacity
             
-            # 2. Hvis simpel failer, prøv at optimere rækkefølgen (TSP) for at se om det KAN lade sig gøre
             if (!time_ok) {
-               # Vi optimerer kun hvis ruten er over grænsen, for at se om vi kan redde den
-               # Dette sikrer at 'tvungne' grupper der er ulogisk sammensat i standard-algoritmen
-               # alligevel får lov at merge, HVIS de kan optimeres til at være lovlige.
                opt_route <- optimize_sequence(new_route, time_matrix)
                opt_time <- calculate_route_time(opt_route, time_matrix, all_locations)
-               
                if (opt_time <= tour_capacity) {
                  time_ok <- TRUE
-                 new_route <- opt_route # VIGTIGT: Opdater rækkefølgen så endepunkterne passer til virkeligheden
+                 new_route <- opt_route 
                }
             }
-            # --- INTELLIGENT MERGE LOGIC END ---
-
-            # Force Apart Logic (Brug listen direkte)
+            
             conflict_found <- check_conflicts(new_route, all_locations, force_apart)
             
             if (time_ok && !conflict_found) {
@@ -649,20 +698,13 @@ server <- function(input, output, session) {
       }
       
       incProgress(0.8, detail = "Finjusterer rækkefølge (TSP)")
-      
-      # Set Seed for reproducibility
       set.seed(42)
 
-      # TSP Optimization - OPDATERET MED SIKKERHEDSVENTIL
       daily_plans <- lapply(1:length(routes), function(day) {
         route_indices <- routes[[day]]
-        
-        # Beregn oprindelig tid (fra Clarke-Wright) - denne er garanteret <= capacity
         original_time <- calculate_route_time(route_indices, time_matrix, all_locations)
+        route_time <- original_time 
         
-        route_time <- original_time # Default til original
-        
-        # Forsøg optimering
         if(length(route_indices) > 2) {
           stops_for_day <- c(1, route_indices) 
           sub_matrix <- time_matrix[stops_for_day, stops_for_day]
@@ -684,11 +726,8 @@ server <- function(input, output, session) {
           actual_route_order <- stops_for_day[ordered_indices_local]
           actual_route_order <- actual_route_order[actual_route_order != 1]
           
-          # Beregn ny tid med optimeret rækkefølge
           optimized_time <- calculate_route_time(actual_route_order, time_matrix, all_locations)
           
-          # VIGTIGT: Accepter KUN optimeringen hvis den faktisk er bedre eller ligeså god
-          # OG den skal overholde tidsgrænsen (selvom den normalt vil være mindre)
           if(optimized_time <= original_time) {
             route_indices <- actual_route_order
             route_time <- optimized_time
@@ -699,90 +738,77 @@ server <- function(input, output, session) {
           Day = day,
           StopOrder = 1:length(route_indices),
           StationNumber = all_locations$StationNumber[route_indices],
+          StationName = all_locations$StationName[route_indices],
           DailyRouteTime_min = round(route_time, 1)
         )
       })
       
       routing_plan_df <- bind_rows(daily_plans) %>%
-        left_join(stations_df, by = "StationNumber") %>%
+        left_join(select(stations_df, -any_of("StationName")), by = "StationNumber") %>% # FIX DUPLICATE COLUMNS
         arrange(Day, StopOrder)
       
-      # Gem Resultater
       vals$routing_plan <- routing_plan_df
       
-      
-      # --- NY FUNKTION: BEREGN DETALJERET TABEL FOR NUVÆRENDE PLAN ---
-      
-      # Filtrer nuværende plan til kun at inkludere de stationer vi har data på
+      # --- BEREGN DETALJERET TABEL FOR NUVÆRENDE PLAN (MED ÆNDRINGER) ---
+      # Brug den redigerede version (vals$BLG_togter)
       nuv_data <- vals$BLG_togter %>%
         mutate(StationNumber = ny) %>%
         filter(StationNumber %in% all_locations$StationNumber)
       
       if(nrow(nuv_data) > 0) {
         current_plans_list <- lapply(unique(nuv_data$togt), function(d) {
-          # Hent stationer for denne dag
           day_stations <- nuv_data %>% filter(togt == d) %>% pull(StationNumber)
-          
-          # Find indeks i all_locations (som passer til matricen)
           indices <- match(day_stations, all_locations$StationNumber)
           indices <- indices[!is.na(indices)]
           
           if(length(indices) == 0) return(NULL)
           
-          # Optimer rækkefølgen (fair sammenligning)
           optimized_idx <- optimize_sequence(indices, time_matrix)
-          
-          # Beregn tid
           route_time <- calculate_route_time(optimized_idx, time_matrix, all_locations)
           
-          # Byg dataframe
           data.frame(
             Day = d,
             StopOrder = 1:length(optimized_idx),
             StationNumber = all_locations$StationNumber[optimized_idx],
+            StationName = all_locations$StationName[optimized_idx],
             DailyRouteTime_min = round(route_time, 1)
           )
         })
         
         current_plan_df <- bind_rows(current_plans_list) %>%
-          left_join(stations_df, by = "StationNumber") %>% # Hent SampleDuration_min m.m.
+          left_join(select(stations_df, -any_of("StationName")), by = "StationNumber") %>% # FIX DUPLICATE COLUMNS
           arrange(Day, StopOrder)
         
         vals$current_plan_detailed <- current_plan_df
       } else {
         vals$current_plan_detailed <- NULL
       }
-      # -------------------------------------------------------------
       
+      # --- TJEK OM REGLER OVERHOLDES (ADVARSLER) ---
+      warnings_list <- c()
       
-      # --- TJEK OM TVUNGE GRUPPER BLEV SPLITTET (ROBUST POPUP) ---
-      split_warnings <- c()
-      
+      # Tjek: Tvungne grupper splittet?
       for (i in seq_along(force_together)) {
-        # SIKR DIG AT GRUPPEN ER TEKST (CHARACTER)
         group <- as.character(force_together[[i]])
-        
-        # Find stationer fra gruppen i den faktiske plan. 
-        # Konverter StationNumber til character for at undgå ID-fejl (123 vs "123")
-        group_in_plan <- routing_plan_df %>%
-          filter(as.character(StationNumber) %in% group)
-        
-        # Find hvilke dage de er endt på
+        group_in_plan <- routing_plan_df %>% filter(as.character(StationNumber) %in% group)
         station_days <- unique(group_in_plan$Day)
-        
-        # Hvis de er fordelt på mere end 1 dag
         if (length(station_days) > 1) {
-          # Hent navne på de stationer der er splittet for bedre info
-          stations_split <- paste(unique(group_in_plan$StationNumber), collapse=", ")
-          split_warnings <- c(split_warnings, 
-                              paste0("Gruppe ", i, " (", stations_split, ") er splittet over ", length(station_days), " dage pga. tidsbegrænsning."))
+          stations_split <- paste(unique(group_in_plan$StationName), collapse=", ") # Brug Navn nu!
+          warnings_list <- c(warnings_list, paste0("Tvunget gruppe ", i, " (", stations_split, ") splittet over ", length(station_days), " dage."))
         }
       }
       
-      if (length(split_warnings) > 0) {
+      # Tjek: Minimum stationer pr dag?
+      stops_per_day <- table(routing_plan_df$Day)
+      bad_days <- names(stops_per_day)[stops_per_day < input$min_stops]
+      if(length(bad_days) > 0) {
+        warnings_list <- c(warnings_list, paste0("Minimumsgrænse underskredet på dag: ", paste(bad_days, collapse=", ")))
+      }
+      
+      if (length(warnings_list) > 0) {
         showModal(modalDialog(
-          title = "Advarsel: Tvungne grupper splittet!",
-          HTML(paste(split_warnings, collapse = "<br/><br/>")),
+          title = "Advarsel",
+          HTML(paste(warnings_list, collapse = "<br/><br/>")),
           footer = modalButton("Forstået"),
           easyClose = TRUE,
           fade = FALSE
@@ -808,50 +834,36 @@ server <- function(input, output, session) {
   optimized_map_reactive <- reactive({
     req(vals$routing_plan)
     df <- vals$routing_plan
-    
     pal <- colorFactor(palette = "Paired", domain = df$Day)
-    
-    # Hent origin koordinater
     orig_lon <- vals$origin_df$Longitude
     orig_lat <- vals$origin_df$Latitude
     
-    # Start kort
     map <- leaflet(df) %>% addTiles()
     
-    # Tegn linjer for hver dag (Origin -> Stations -> Origin)
     days <- unique(df$Day)
     for(d in days) {
       day_data <- df %>% filter(Day == d) %>% arrange(StopOrder)
-      
-      # Byg sti: Origin -> Stationer -> Origin
       lngs <- c(orig_lon, day_data$Longitude, orig_lon)
       lats <- c(orig_lat, day_data$Latitude, orig_lat)
-      
-      map <- map %>% addPolylines(lng = lngs, lat = lats, 
-                                  color = pal(d), weight = 3, opacity = 0.8)
+      map <- map %>% addPolylines(lng = lngs, lat = lats, color = pal(d), weight = 3, opacity = 0.8)
     }
     
-    # Tilføj punkter ovenpå
     map <- map %>%
       addCircleMarkers(lng = ~Longitude, lat = ~Latitude,
                        color = ~pal(Day), stroke = FALSE, fillOpacity = 0.8, radius = 8,
-                       label = ~paste("Station:", StationNumber, "<br>Dag:", Day, "<br>Stop:", StopOrder),
-                       popup = ~paste("<b>Station:</b>", StationNumber, "<br>",
+                       label = ~paste("Station:", StationName, "(", StationNumber, ")", "<br>Dag:", Day, "<br>Stop:", StopOrder),
+                       popup = ~paste("<b>Station:</b>", StationName, "<br>",
+                                      "<b>Nummer:</b>", StationNumber, "<br>",
                                       "<b>Prøvetid:</b>", SampleDuration_min, "min")) %>%
       addLegend("bottomright", pal = pal, values = ~Day, title = "Dag")
-    
     map
   })
   
-  output$map_optimized <- renderLeaflet({
-    optimized_map_reactive()
-  })
+  output$map_optimized <- renderLeaflet({ optimized_map_reactive() })
   
   output$download_map_html <- downloadHandler(
     filename = function() { paste("ruteplan_kort_", Sys.Date(), ".html", sep="") },
-    content = function(file) {
-      saveWidget(optimized_map_reactive(), file = file, selfcontained = TRUE)
-    }
+    content = function(file) { saveWidget(optimized_map_reactive(), file = file, selfcontained = TRUE) }
   )
   
   output$schedule_table <- renderDT({
@@ -859,24 +871,108 @@ server <- function(input, output, session) {
     datatable(vals$routing_plan, options = list(pageLength = 25))
   })
   
-  # NY TABEL: CURRENT PLAN DETAILED
+  output$download_plan <- downloadHandler(
+    filename = function() { paste("køreplan_", Sys.Date(), ".csv", sep = "") },
+    content = function(file) { write.csv(vals$routing_plan, file, row.names = FALSE) }
+  )
+  output$download_plan_xlsx <- downloadHandler(
+    filename = function() { paste("køreplan_", Sys.Date(), ".xlsx", sep = "") },
+    content = function(file) { write.xlsx(vals$routing_plan, file) }
+  )
+  output$download_plan_html <- downloadHandler(
+    filename = function() { paste("køreplan_", Sys.Date(), ".html", sep = "") },
+    content = function(file) { saveWidget(datatable(vals$routing_plan), file = file, selfcontained = TRUE) }
+  )
+  
+  # NEW: Download as BLG Format with 'gammel' lookup logic
+  output$download_blg_format <- downloadHandler(
+    filename = function() { paste("BLG_forslag_", Sys.Date(), ".csv", sep = "") },
+    content = function(file) {
+      
+      # Create mapping from original data
+      # vals$BLG_togter contains the loaded CSV
+      mapping <- vals$BLG_togter %>% 
+        select(ny, gammel) %>% 
+        distinct(ny, .keep_all = TRUE) # Ensure unique 'ny' keys
+      
+      blg_output <- vals$routing_plan %>%
+        left_join(mapping, by = c("StationNumber" = "ny")) %>%
+        mutate(
+          ny = StationNumber,
+          # gammel comes from join. If NA (new station), fallback to StationNumber
+          gammel = ifelse(is.na(gammel), StationNumber, gammel),
+          navn = StationName,
+          togt = Day
+        ) %>%
+        select(ny, gammel, navn, togt)
+      
+      write.table(blg_output, file, sep = ";", row.names = FALSE, quote = FALSE, fileEncoding = "UTF-8")
+    }
+  )
+  
+  # Kort: Nuværende Plan (Manuel)
+  current_map_reactive <- reactive({
+    req(vals$current_plan_detailed)
+    df <- vals$current_plan_detailed
+    pal <- colorFactor(palette = "Set2", domain = df$Day)
+    orig_lon <- vals$origin_df$Longitude
+    orig_lat <- vals$origin_df$Latitude
+    
+    map <- leaflet(df) %>% addTiles()
+    
+    days <- unique(df$Day)
+    for(d in days) {
+      day_data <- df %>% filter(Day == d) %>% arrange(StopOrder)
+      lngs <- c(orig_lon, day_data$Longitude, orig_lon)
+      lats <- c(orig_lat, day_data$Latitude, orig_lat)
+      map <- map %>% addPolylines(lng = lngs, lat = lats, color = pal(d), weight = 3, opacity = 0.8)
+    }
+    
+    map <- map %>%
+      addCircleMarkers(lng = ~Longitude, lat = ~Latitude,
+                       color = ~pal(Day), stroke = FALSE, fillOpacity = 0.8, radius = 6,
+                       label = ~paste("Station:", StationName, "(", StationNumber, ")", "<br>Togt:", Day)) %>%
+      addLegend("bottomright", pal = pal, values = ~Day, title = "Nuv. Togt")
+    map
+  })
+  
+  output$map_current <- renderLeaflet({ current_map_reactive() })
+  
+  output$download_map_current_html <- downloadHandler(
+    filename = function() { paste("nuvaerende_plan_kort_", Sys.Date(), ".html", sep="") },
+    content = function(file) { saveWidget(current_map_reactive(), file = file, selfcontained = TRUE) }
+  )
+  
+  # Tabel: Nuværende Plan
   output$current_schedule_table <- renderDT({
     req(vals$current_plan_detailed)
     datatable(vals$current_plan_detailed, options = list(pageLength = 25))
   })
-  
   output$download_current_plan <- downloadHandler(
     filename = function() { paste("nuværende_plan_detaljeret_", Sys.Date(), ".csv", sep = "") },
-    content = function(file) {
-      write.csv(vals$current_plan_detailed, file, row.names = FALSE)
-    }
+    content = function(file) { write.csv(vals$current_plan_detailed, file, row.names = FALSE) }
+  )
+  output$download_current_plan_xlsx <- downloadHandler(
+    filename = function() { paste("nuværende_plan_detaljeret_", Sys.Date(), ".xlsx", sep = "") },
+    content = function(file) { write.xlsx(vals$current_plan_detailed, file) }
+  )
+  output$download_current_plan_html <- downloadHandler(
+    filename = function() { paste("nuværende_plan_detaljeret_", Sys.Date(), ".html", sep = "") },
+    content = function(file) { saveWidget(datatable(vals$current_plan_detailed), file = file, selfcontained = TRUE) }
   )
   
-  # NYE OUTPUTS TIL RÅDATA OG MATRIX
-  
+  # OUTPUTS: RAW DATA (EDITABLE BLG)
   output$table_blg <- renderDT({
     req(vals$BLG_togter)
-    datatable(vals$BLG_togter, options = list(pageLength = 15, scrollX = TRUE))
+    datatable(vals$BLG_togter, 
+              editable = TRUE, # Gør tabellen editerbar
+              extensions = c('FixedColumns', 'FixedHeader'),
+              options = list(
+                pageLength = 15, 
+                scrollX = TRUE,
+                fixedHeader = TRUE,
+                fixedColumns = list(leftColumns = 2) # Lås de to første kolonner (formodentlig ID/navn)
+              ))
   })
   
   output$table_wms <- renderDT({
@@ -886,142 +982,43 @@ server <- function(input, output, session) {
   
   output$table_matrix <- renderDT({
     req(vals$time_matrix, vals$all_locations_final)
-    
-    # Konverter matrix til dataframe for visning
     mat_df <- as.data.frame(vals$time_matrix)
-    
-    # Sæt navne på rækker og kolonner baseret på stationsnumre
-    # all_locations indeholder "Origin" på plads 1 og derefter stationer
-    names_vec <- vals$all_locations_final$StationNumber
+    names_vec <- vals$all_locations_final$StationName
+    names_vec[names_vec == "Svendborg Lab"] <- "Lab" 
     colnames(mat_df) <- names_vec
     rownames(mat_df) <- names_vec
-    
-    datatable(mat_df, options = list(pageLength = 15, scrollX = TRUE), 
-              caption = "Rejsetid i minutter (fra række til kolonne)")
+    datatable(mat_df, editable = TRUE, options = list(pageLength = 15, scrollX = TRUE), caption = "Rejsetid i minutter")
   })
   
-  output$download_plan <- downloadHandler(
-    filename = function() { paste("køreplan_", Sys.Date(), ".csv", sep = "") },
-    content = function(file) {
-      write.csv(vals$routing_plan, file, row.names = FALSE)
+  # Matrix edit observer
+  observeEvent(input$table_matrix_cell_edit, {
+    info <- input$table_matrix_cell_edit
+    new_val <- as.numeric(info$value)
+    if(!is.na(new_val)) {
+      vals$time_matrix[info$row, info$col] <- new_val
     }
-  )
-  
-  # --- TRIN 5: SAMMENLIGNING ---
-  
-  output$map_current <- renderLeaflet({
-    req(vals$data_loaded)
-    
-    # Byg nuværende plan
-    nuv <- left_join(vals$BLG_togter, vals$st, by = c("ny" = "StationNumber")) %>%
-      select(StationNumber = ny, Day = togt, Longitude, Latitude) %>%
-      drop_na()
-    
-    pal <- colorFactor(palette = "Set2", domain = nuv$Day)
-    
-    # Hent origin koordinater
-    orig_lon <- vals$origin_df$Longitude
-    orig_lat <- vals$origin_df$Latitude
-    
-    # Start kort
-    map <- leaflet(nuv) %>% addTiles()
-    
-    days <- unique(nuv$Day)
-    for(d in days) {
-      day_data <- nuv %>% filter(Day == d) 
-      
-      # ----------------------------------------------------
-      # OPTIMERING AF RUTE PÅ KORT (hvis matrix findes)
-      # ----------------------------------------------------
-      # Standard: Brug CSV rækkefølge
-      lngs <- c(orig_lon, day_data$Longitude, orig_lon)
-      lats <- c(orig_lat, day_data$Latitude, orig_lat)
-      
-      # Hvis matrix og locations er beregnet (efter knap-tryk), så optimer
-      if(!is.null(vals$time_matrix) && !is.null(vals$all_locations_final)) {
-         
-         # Find indekser for stationerne i all_locations
-         ids <- day_data$StationNumber
-         matrix_indices <- match(ids, vals$all_locations_final$StationNumber)
-         
-         # Kun hvis alle stationer findes i matricen (dvs. ingen er ekskluderet)
-         if(!any(is.na(matrix_indices))) {
-             # Optimer rækkefølge
-             opt_indices <- optimize_sequence(matrix_indices, vals$time_matrix)
-             
-             # Hent koordinater i den NYE rækkefølge
-             # (Vi bruger vals$all_locations_final fordi den matcher matrix-indeks)
-             ordered_locs <- vals$all_locations_final[opt_indices, ]
-             
-             lngs <- c(orig_lon, ordered_locs$Longitude, orig_lon)
-             lats <- c(orig_lat, ordered_locs$Latitude, orig_lat)
-         }
-      }
-      # ----------------------------------------------------
-      
-      map <- map %>% addPolylines(lng = lngs, lat = lats, 
-                                  color = pal(d), weight = 3, opacity = 0.8)
-    }
-    
-    map <- map %>%
-      addCircleMarkers(lng = ~Longitude, lat = ~Latitude,
-                       color = ~pal(Day), stroke = FALSE, fillOpacity = 0.8, radius = 6,
-                       label = ~paste("Station:", StationNumber, "<br>Togt:", Day)) %>%
-      addLegend("bottomright", pal = pal, values = ~Day, title = "Nuv. Togt")
-    
-    map
   })
   
-  # Beregning af sammenligningstabel
+  # Sammenligningstabel
   output$comparison_table <- renderTable({
-    # Vi skal bruge den beregnede time_matrix og all_locations, så brugeren skal have kørt beregningen først
-    req(vals$routing_plan, vals$time_matrix, vals$all_locations_final)
+    req(vals$routing_plan, vals$current_plan_detailed)
     
-    # 1. Beregn Nuværende Plan (BLG)
-    # Filtrer BLG ned til stationer der er med i den aktuelle kørsel (ellers har vi ikke matrix-data)
-    nuv_data <- vals$BLG_togter %>%
-      mutate(StationNumber = ny) %>% # Brug 'ny' kolonnen som ID
-      filter(StationNumber %in% vals$all_locations_final$StationNumber)
+    # Statistik Nuværende (Manuel)
+    nuv <- vals$current_plan_detailed
+    total_nuv <- sum(unique(nuv[, c("Day", "DailyRouteTime_min")])$DailyRouteTime_min)
+    avg_nuv <- total_nuv / length(unique(nuv$Day))
+    days_nuv <- length(unique(nuv$Day))
     
-    if(nrow(nuv_data) == 0) return(data.frame(Besked = "Ingen fælles stationer i nuværende plan og ny beregning."))
+    # Statistik Ny (Auto)
+    ny <- vals$routing_plan
+    total_ny <- sum(unique(ny[, c("Day", "DailyRouteTime_min")])$DailyRouteTime_min)
+    avg_ny <- total_ny / length(unique(ny$Day))
+    days_ny <- length(unique(ny$Day))
     
-    nuv_summary <- nuv_data %>%
-      group_by(togt) %>%
-      summarise(
-        Antal_Stop = n(),
-        route_indices = list(match(StationNumber, vals$all_locations_final$StationNumber)),
-        .groups = 'drop'
-      ) %>%
-      mutate(
-        # Beregn tid for denne gamle rute med de nye rejsetider
-        # MEN: Vi optimerer rækkefølgen først med 'optimize_sequence'
-        Tid_min = sapply(route_indices, function(idx) {
-          # 1. Optimer rækkefølgen af stop (for fair sammenligning)
-          optimized_idx <- optimize_sequence(idx, vals$time_matrix)
-          # 2. Beregn tid
-          calculate_route_time(optimized_idx, vals$time_matrix, vals$all_locations_final)
-        })
-      )
-    
-    total_nuv <- sum(nuv_summary$Tid_min)
-    avg_nuv <- mean(nuv_summary$Tid_min)
-    
-    # 2. Beregn Ny Plan (Routing Plan)
-    ny_summary <- vals$routing_plan %>%
-      group_by(Day) %>%
-      summarise(
-        Antal_Stop = n(),
-        Tid_min = unique(DailyRouteTime_min) # Den er allerede beregnet per dag i algoritmen
-      )
-    
-    total_ny <- sum(ny_summary$Tid_min)
-    avg_ny <- mean(ny_summary$Tid_min)
-    
-    # 3. Sammenstilling
     data.frame(
-      Parameter = c("Antal Dage (Togter)", "Total Tid (min)", "Gns. Tid pr. Dag (min)", "Stationer dækket (Fælles)"),
-      Nuværende = c(nrow(nuv_summary), round(total_nuv, 0), round(avg_nuv, 0), nrow(nuv_data)),
-      Ny_Plan = c(nrow(ny_summary), round(total_ny, 0), round(avg_ny, 0), nrow(vals$routing_plan))
+      Parameter = c("Antal Dage (Togter)", "Total Tid (min)", "Gns. Tid pr. Dag (min)"),
+      Nuværende = c(days_nuv, round(total_nuv, 0), round(avg_nuv, 0)),
+      Ny_Plan = c(days_ny, round(total_ny, 0), round(avg_ny, 0))
     )
   }, digits = 0)
 }
